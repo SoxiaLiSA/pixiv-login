@@ -11,13 +11,21 @@ package ceui.pixiv.login
  *    verify `SHA-256(verifier) == challenge`, proving the token request
  *    came from the same client that initiated the login.
  *
- * The caller **must** persist the [verifier] across the browser round-trip
- * (the login page → callback redirect can take seconds to minutes). A
- * suitable store is anything that survives process death — MMKV,
- * SharedPreferences, or an encrypted DataStore.
+ * ## Persistence
  *
- * @property verifier 43-character URL-safe Base64 string. Sent only to the
- *                    token endpoint; never exposed to the browser.
+ * When using the **high-level** API ([PixivOAuthClient.startLogin] /
+ * [PixivOAuthClient.handleCallback]), the client caches the verifier
+ * in memory — the caller never touches it.
+ *
+ * When using the **low-level** API ([PixivOAuthClient.buildLoginUrl] /
+ * [PixivOAuthClient.exchangeCode]), the caller **must** persist the
+ * [verifier] across the browser round-trip (the login page → callback
+ * redirect can take seconds to minutes). A suitable store is anything
+ * that survives process death — MMKV, SharedPreferences, or an
+ * encrypted DataStore.
+ *
+ * @property verifier  43-character URL-safe Base64 string. Sent only to
+ *                     the token endpoint; never exposed to the browser.
  * @property challenge SHA-256 hash of [verifier], Base64-encoded. Embedded
  *                     in the login URL and visible in the browser address bar.
  */

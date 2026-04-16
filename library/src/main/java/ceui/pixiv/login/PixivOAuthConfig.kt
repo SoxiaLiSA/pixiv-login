@@ -17,9 +17,13 @@ package ceui.pixiv.login
  *
  * ```kotlin
  * val myConfig = PixivOAuthConfig(
- *     clientId     = "...",
- *     clientSecret = "...",
- *     // ...
+ *     clientId       = "...",
+ *     clientSecret   = "...",
+ *     redirectUri    = "https://my-api.pixiv.net/web/v1/users/auth/pixiv/callback",
+ *     loginUrl       = "https://my-api.pixiv.net/web/v1/login",
+ *     clientParam    = "my-client",
+ *     tokenEndpointPath = "v2/auth/token",
+ *     callbackScheme = "my-scheme",
  * )
  * ```
  *
@@ -29,39 +33,43 @@ package ceui.pixiv.login
  * without synchronisation. The companion-object instances are singletons
  * and likewise safe.
  *
- * @property clientId        OAuth `client_id` issued by Pixiv. Uniquely
- *                           identifies the application (not the user).
- * @property clientSecret    OAuth `client_secret` paired with [clientId].
- *                           On mobile this is **not** truly secret — it is
- *                           compiled into the APK — but Pixiv's flow still
- *                           requires it alongside PKCE.
- * @property redirectUri     The `redirect_uri` registered with [clientId].
- *                           Must match exactly, including scheme and path,
- *                           or the token exchange will be rejected.
- * @property loginUrl        Base URL of the login page served by the
- *                           product's API gateway (e.g.
- *                           `https://app-api.pixiv.net/web/v1/login`).
- *                           [PixivOAuthClient.buildLoginUrl] appends query
- *                           parameters to this URL.
- * @property clientParam     The `client` query-parameter value appended to
- *                           the login URL. Tells the server which platform
- *                           variant to serve (e.g. `pixiv-android`,
- *                           `comic_ios`). This controls the callback
- *                           scheme the server redirects to after login.
+ * @property clientId         OAuth `client_id` issued by Pixiv. Uniquely
+ *                            identifies the application (not the user).
+ * @property clientSecret     OAuth `client_secret` paired with [clientId].
+ *                            On mobile this is **not** truly secret — it is
+ *                            compiled into the APK — but Pixiv's flow still
+ *                            requires it alongside PKCE.
+ * @property redirectUri      The `redirect_uri` registered with [clientId].
+ *                            Must match exactly, including scheme and path,
+ *                            or the token exchange will be rejected.
+ * @property loginUrl         Base URL of the login page served by the
+ *                            product's API gateway (e.g.
+ *                            `https://app-api.pixiv.net/web/v1/login`).
+ *                            [PixivOAuthClient.buildLoginUrl] appends query
+ *                            parameters to this URL.
+ * @property clientParam      The `client` query-parameter value appended to
+ *                            the login URL. Tells the server which platform
+ *                            variant to serve (e.g. `pixiv-android`,
+ *                            `comic_ios`). **This controls the callback
+ *                            scheme** the server redirects to after login —
+ *                            make sure [callbackScheme] matches.
  * @property tokenEndpointPath
- *                           Path relative to [oauthBaseUrl] for the token
- *                           endpoint. Pixiv's main app uses `auth/token`;
- *                           Comic uses `v2/auth/token`.
- * @property callbackScheme  The custom URI scheme the server redirects to
- *                           after login (e.g. `"pixiv"`, `"pixiv-manga"`).
- *                           The calling app must register an intent-filter
- *                           for this scheme so the OS routes the callback
- *                           back to the app. [PixivOAuthClient.isOAuthCallback]
- *                           uses this to identify callback URIs.
- * @property oauthBaseUrl    Base URL of the Pixiv OAuth server. All known
- *                           clients share `https://oauth.secure.pixiv.net/`.
- *                           Exposed for forward-compatibility — if Pixiv
- *                           ever moves the OAuth host, callers can override.
+ *                            Path relative to [oauthBaseUrl] for the token
+ *                            endpoint. Must **not** start with `/` — Retrofit's
+ *                            `@Url` treats absolute paths differently, and a
+ *                            leading slash would bypass [oauthBaseUrl] entirely.
+ *                            Pixiv's main app uses `auth/token`;
+ *                            Comic uses `v2/auth/token`.
+ * @property callbackScheme   The custom URI scheme the server redirects to
+ *                            after login (e.g. `"pixiv"`, `"pixiv-manga"`).
+ *                            The calling app must register an intent-filter
+ *                            for this scheme so the OS routes the callback
+ *                            back to the app. [PixivOAuthClient.isOAuthCallback]
+ *                            uses this to identify callback URIs.
+ * @property oauthBaseUrl     Base URL of the Pixiv OAuth server. All known
+ *                            clients share `https://oauth.secure.pixiv.net/`.
+ *                            Exposed for forward-compatibility — if Pixiv
+ *                            ever moves the OAuth host, callers can override.
  */
 data class PixivOAuthConfig(
     val clientId: String,
@@ -77,15 +85,27 @@ data class PixivOAuthConfig(
     init {
         require(clientId.isNotBlank()) { "clientId must not be blank" }
         require(clientSecret.isNotBlank()) { "clientSecret must not be blank" }
-        require(redirectUri.isNotBlank()) { "redirectUri must not be blank" }
+        require(redirectUri.startsWith("https://")) {
+            "redirectUri must use HTTPS: $redirectUri"
+        }
         require(loginUrl.startsWith("https://")) {
             "loginUrl must use HTTPS: $loginUrl"
         }
+        require(!loginUrl.contains('?')) {
+            "loginUrl must not contain query parameters (they are appended by buildLoginUrl): $loginUrl"
+        }
         require(clientParam.isNotBlank()) { "clientParam must not be blank" }
         require(tokenEndpointPath.isNotBlank()) { "tokenEndpointPath must not be blank" }
+        require(!tokenEndpointPath.startsWith("/")) {
+            "tokenEndpointPath must be relative (no leading '/'): $tokenEndpointPath — " +
+                "a leading slash would make Retrofit's @Url ignore oauthBaseUrl"
+        }
         require(callbackScheme.isNotBlank()) { "callbackScheme must not be blank" }
         require(!callbackScheme.contains("://")) {
-            "callbackScheme should be the scheme only (e.g. \"pixiv\"), not a URI"
+            "callbackScheme must be the scheme only (e.g. \"pixiv\"), not a URI: $callbackScheme"
+        }
+        require(oauthBaseUrl.startsWith("https://")) {
+            "oauthBaseUrl must use HTTPS: $oauthBaseUrl"
         }
         require(oauthBaseUrl.endsWith("/")) {
             "oauthBaseUrl must end with '/': $oauthBaseUrl"
@@ -100,7 +120,7 @@ data class PixivOAuthConfig(
          * Standard Pixiv Android app.
          *
          * - Login page on `app-api.pixiv.net`.
-         * - Token endpoint at `/auth/token`.
+         * - Token endpoint at `auth/token`.
          * - Callback redirects to `pixiv://account/login?code=…`.
          */
         val PIXIV_ANDROID = PixivOAuthConfig(
@@ -114,10 +134,10 @@ data class PixivOAuthConfig(
         )
 
         /**
-         * Pixiv Comic (pixivコミック) iOS app.
+         * Pixiv Comic (pixivコミック) iOS client.
          *
          * - Login page on `comic-api.pixiv.net`.
-         * - Token endpoint at `/v2/auth/token`.
+         * - Token endpoint at `v2/auth/token`.
          * - Callback redirects to `pixiv-manga://account/login?code=…`.
          *
          * Uses the iOS client identity because the Android-specific

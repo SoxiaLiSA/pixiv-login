@@ -32,24 +32,42 @@ import java.util.concurrent.TimeUnit
  * ## PKCE lifecycle
  *
  * [startLogin] generates a PKCE pair internally and caches the verifier
- * so the caller never touches it. [handleCallback] consumes the cached
- * verifier and clears it. If the app process dies between the two calls
- * (rare — the Chrome Tab round-trip typically takes seconds), the cached
- * verifier is lost and [handleCallback] returns [PixivOAuthResult.Failure];
- * the user simply retries login.
+ * so the caller never touches it. [handleCallback] / [tryHandleCallback]
+ * consumes the cached verifier and clears it. If the app process dies
+ * between the two calls (rare — the Chrome Tab round-trip typically
+ * takes seconds), the cached verifier is lost and [handleCallback]
+ * returns [PixivOAuthResult.Failure]; the user simply retries login.
  *
  * For callers that need to survive process death (e.g. persist the
- * verifier in MMKV), the lower-level [exchangeCode] accepts an explicit
- * verifier.
+ * verifier in MMKV), the lower-level [buildLoginUrl] + [exchangeCode]
+ * pair accepts an explicit verifier.
  *
  * ## Thread safety
  *
- * All public methods are safe to call from any thread. [handleCallback],
- * [exchangeCode], and [refreshToken] perform **synchronous** blocking
- * I/O — call them from a background thread or inside
- * `withContext(Dispatchers.IO)`. They are synchronous by design so they
- * can be used both from coroutines and from OkHttp's synchronous
- * [okhttp3.Authenticator] callback without requiring `runBlocking`.
+ * All public methods are safe to call from any thread.
+ *
+ * [startLogin] and [buildLoginUrl] are non-blocking and return
+ * immediately. [tryHandleCallback], [handleCallback], [exchangeCode],
+ * and [refreshToken] perform **synchronous blocking I/O** — call them
+ * from a background thread or inside `withContext(Dispatchers.IO)`.
+ * They are synchronous by design so they can be used both from
+ * coroutines and from OkHttp's synchronous [okhttp3.Authenticator]
+ * callback without requiring `runBlocking`.
+ *
+ * The internal PKCE cache ([pendingVerifier]) uses a single `@Volatile`
+ * field. This is safe under the assumption that only **one login flow
+ * is in progress at a time** — the normal case for interactive login.
+ * Concurrent [startLogin] calls race on the write, and the last writer
+ * wins; this is acceptable because the user can only be on one login
+ * page at once.
+ *
+ * ## Lifecycle
+ *
+ * This class is designed to be held as a long-lived singleton (e.g.
+ * in your `Application` or DI graph). The internal [OkHttpClient] is
+ * created once and reused for all requests. There is no `close()`
+ * method — the client is lightweight and safe to abandon; the
+ * underlying connection pool will idle-close on its own.
  *
  * ## Typical usage
  *
@@ -74,13 +92,20 @@ import java.util.concurrent.TimeUnit
  * [PixivOAuthConfig.callbackScheme] in AndroidManifest.xml so the OS
  * routes the OAuth redirect back to the app.
  *
- * @param config   identifies which Pixiv product and credentials to use.
- * @param logHttp  enable HTTP body-level logging. Useful during
- *                 development; disable in production to avoid leaking
- *                 tokens to logcat.
+ * @param config     identifies which Pixiv product and credentials to use.
+ * @param baseClient optional [OkHttpClient] to derive from. The client
+ *                   calls [OkHttpClient.newBuilder] on it and applies
+ *                   timeouts, so the caller's interceptors (Chucker,
+ *                   custom DNS, etc.) are inherited without mutation.
+ *                   Pass `null` (the default) to create a standalone
+ *                   client with no shared interceptors.
+ * @param logHttp    enable HTTP body-level logging. Useful during
+ *                   development; **disable in production** to avoid
+ *                   leaking tokens and secrets to logcat.
  */
 class PixivOAuthClient(
     val config: PixivOAuthConfig,
+    baseClient: OkHttpClient? = null,
     logHttp: Boolean = false,
 ) {
 
@@ -89,10 +114,10 @@ class PixivOAuthClient(
         coerceInputValues = true
     }
 
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+    private val httpClient: OkHttpClient = (baseClient?.newBuilder() ?: OkHttpClient.Builder())
+        .connectTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .writeTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .apply {
             if (logHttp) {
                 addInterceptor(
@@ -128,12 +153,12 @@ class PixivOAuthClient(
      * Start a login flow: generate PKCE, cache the verifier, and return
      * the login URL to open in a Chrome Custom Tab or WebView.
      *
-     * After the user authenticates, the server redirects to a custom
-     * scheme (e.g. `pixiv://account/login?code=…`). Intercept that
-     * redirect, extract the `code` query parameter, and pass it to
-     * [handleCallback].
+     * After the user authenticates, the server redirects to
+     * `{callbackScheme}://account/login?code=…`. Intercept that redirect
+     * via an intent-filter on [PixivOAuthConfig.callbackScheme] and pass
+     * the received [Intent] to [tryHandleCallback].
      *
-     * Calling [startLogin] again before [handleCallback] discards the
+     * Calling [startLogin] again before [tryHandleCallback] discards the
      * previous PKCE pair — only the most recent login flow is valid.
      *
      * @return full login URL ready to open in a browser.
@@ -145,23 +170,12 @@ class PixivOAuthClient(
     }
 
     /**
-     * Check whether a [Uri] is an OAuth callback for this client.
-     *
-     * Use this in your Activity's `onCreate` / `onNewIntent` to decide
-     * whether the incoming intent should be routed to [handleCallback]:
-     *
-     * ```kotlin
-     * val uri = intent?.data ?: return
-     * if (client.isOAuthCallback(uri)) {
-     *     lifecycleScope.launch(Dispatchers.IO) {
-     *         client.handleCallback(uri)
-     *             .onSuccess { /* save tokens */ }
-     *     }
-     * }
-     * ```
+     * Check whether [uri] is an OAuth callback for this client.
      *
      * Matches when the URI scheme equals [PixivOAuthConfig.callbackScheme]
-     * (e.g. `pixiv`, `pixiv-manga`).
+     * (e.g. `pixiv`, `pixiv-manga`). Does **not** validate host or path
+     * — the server owns the redirect shape, and different Pixiv products
+     * may use different paths.
      */
     fun isOAuthCallback(uri: Uri): Boolean {
         return uri.scheme == config.callbackScheme
@@ -171,18 +185,28 @@ class PixivOAuthClient(
      * If [intent] carries an OAuth callback, exchange the code for tokens
      * and return the result. Otherwise return `null`.
      *
-     * Call this from **both** `onCreate` and `onNewIntent` — one line
-     * covers both cold-start and warm-start paths:
+     * Designed to be called from **both** `onCreate` and `onNewIntent` —
+     * one method covers both cold-start and warm-start:
      *
      * ```kotlin
-     * // In your Activity — works for both onCreate and onNewIntent:
      * private fun handleIntent(intent: Intent?) {
      *     val result = client.tryHandleCallback(intent) ?: return
      *     result.onSuccess { save(it.accessToken) }
      * }
+     *
+     * override fun onCreate(savedInstanceState: Bundle?) {
+     *     super.onCreate(savedInstanceState)
+     *     handleIntent(intent)
+     * }
+     *
+     * override fun onNewIntent(intent: Intent) {
+     *     super.onNewIntent(intent)
+     *     handleIntent(intent)
+     * }
      * ```
      *
-     * **Blocking I/O** — call from a background thread.
+     * **Blocking I/O** — call from a background thread. The `null`-return
+     * path (non-OAuth intent) is non-blocking and safe on the main thread.
      *
      * @param intent the incoming intent (may be `null`, may carry a
      *               non-OAuth URI, or may carry the callback).
@@ -197,7 +221,7 @@ class PixivOAuthClient(
 
     /**
      * Complete the login flow by extracting the authorization code from
-     * the callback [Uri] and exchanging it for tokens.
+     * the callback [uri] and exchanging it for tokens.
      *
      * **Blocking I/O** — call from a background thread.
      *
@@ -240,6 +264,9 @@ class PixivOAuthClient(
      *
      * Prefer [startLogin] unless you are managing PKCE persistence
      * yourself (e.g. surviving process death via MMKV).
+     *
+     * The [codeChallenge] is produced by [PkceUtil.generate] and is
+     * already URL-safe Base64 — no additional encoding is applied.
      */
     fun buildLoginUrl(codeChallenge: String): String = buildString {
         append(config.loginUrl)
@@ -251,8 +278,8 @@ class PixivOAuthClient(
     /**
      * Exchange an authorization code with an explicit PKCE verifier.
      *
-     * Prefer [handleCallback] unless you are managing PKCE persistence
-     * yourself.
+     * Prefer [handleCallback] / [tryHandleCallback] unless you are
+     * managing PKCE persistence yourself.
      *
      * **Blocking I/O** — call from a background thread.
      *
@@ -339,6 +366,7 @@ class PixivOAuthClient(
     }
 
     private companion object {
+        private const val TIMEOUT_SECONDS = 15L
         private const val GRANT_TYPE_AUTH_CODE = "authorization_code"
         private const val GRANT_TYPE_REFRESH_TOKEN = "refresh_token"
     }

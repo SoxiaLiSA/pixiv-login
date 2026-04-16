@@ -1,20 +1,28 @@
 package ceui.pixiv.login
 
 /**
- * Outcome of a Pixiv OAuth operation ([PixivOAuthClient.exchangeCode] or
- * [PixivOAuthClient.refreshToken]).
+ * Outcome of a Pixiv OAuth operation ([PixivOAuthClient.handleCallback],
+ * [PixivOAuthClient.exchangeCode], or [PixivOAuthClient.refreshToken]).
  *
  * Callers should exhaustively match both branches:
  *
  * ```kotlin
- * when (val result = client.exchangeCode(code, verifier)) {
+ * when (val result = client.handleCallback(uri)) {
  *     is PixivOAuthResult.Success -> {
- *         val token = result.response.accessToken
+ *         save(result.response.accessToken, result.response.refreshToken)
  *     }
  *     is PixivOAuthResult.Failure -> {
  *         Log.e(TAG, "OAuth failed: HTTP ${result.httpCode} — ${result.message}", result.cause)
  *     }
  * }
+ * ```
+ *
+ * Or use the fluent helpers for a more concise style:
+ *
+ * ```kotlin
+ * client.handleCallback(uri)
+ *     .onSuccess { save(it.accessToken, it.refreshToken) }
+ *     .onFailure { Log.e(TAG, it.message, it.cause) }
  * ```
  *
  * ## Why not `kotlin.Result`?
@@ -40,7 +48,8 @@ sealed class PixivOAuthResult {
      *
      * @property httpCode HTTP status code if the server responded (e.g. 400,
      *                    401, 403). `null` when the failure happened before
-     *                    a response was received (DNS, TLS, timeout).
+     *                    a response was received (DNS, TLS, timeout) or when
+     *                    the error is purely client-side (missing PKCE verifier).
      * @property message  Human-readable description. For server errors this
      *                    is the raw error body; for transport errors it is
      *                    the exception message. Suitable for debug logging,
@@ -48,7 +57,8 @@ sealed class PixivOAuthResult {
      * @property cause    The underlying exception, if any. `null` for
      *                    server-side rejections that returned a valid HTTP
      *                    response (the server said "no", but the transport
-     *                    worked fine).
+     *                    worked fine), and for client-side validation errors
+     *                    (missing code, missing verifier).
      */
     data class Failure(
         val httpCode: Int?,
@@ -58,6 +68,9 @@ sealed class PixivOAuthResult {
 
     /** `true` when this is a [Success]. */
     val isSuccess: Boolean get() = this is Success
+
+    /** `true` when this is a [Failure]. */
+    val isFailure: Boolean get() = this is Failure
 
     /**
      * Run [block] if this is a [Success], returning the same result

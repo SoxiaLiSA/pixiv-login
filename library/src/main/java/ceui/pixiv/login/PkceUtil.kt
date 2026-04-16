@@ -15,19 +15,23 @@ import java.security.SecureRandom
  * request so the server can verify the exchange request is from the same
  * client that initiated the flow.
  *
- * ## Usage
+ * ## When to use directly
+ *
+ * Most callers should use [PixivOAuthClient.startLogin], which generates
+ * and caches the PKCE pair internally. Use this utility directly only if
+ * you need to persist the [PkcePair.verifier] yourself to survive process
+ * death:
  *
  * ```kotlin
  * val pkce = PkceUtil.generate()
- * val loginUrl = client.buildLoginUrl(pkce.challenge)
- * // ... open loginUrl in Chrome Custom Tab ...
- * // ... receive callback with code ...
- * val result = client.exchangeCode(code, pkce.verifier)
+ * mmkv.encode("verifier", pkce.verifier)          // persist
+ * val url = client.buildLoginUrl(pkce.challenge)   // low-level API
+ * // ... callback ...
+ * val result = client.exchangeCode(code, mmkv.decodeString("verifier")!!)
  * ```
  *
- * The caller is responsible for persisting [PkcePair.verifier] across the
- * browser round-trip (e.g. in MMKV / SharedPreferences). This utility is
- * stateless — it generates fresh pairs on every call and does not cache.
+ * This utility is stateless — it generates a fresh pair on every call
+ * and does not cache.
  */
 object PkceUtil {
 
@@ -44,6 +48,9 @@ object PkceUtil {
      * - **Challenge**: SHA-256 digest of the ASCII-encoded verifier,
      *   encoded as URL-safe Base64 without padding. This is the `S256`
      *   method defined in RFC 7636 §4.2.
+     *
+     * SHA-256 is guaranteed to be available on all Android devices
+     * (it is a mandatory JCA provider), so this method never throws.
      */
     fun generate(): PkcePair {
         val verifier = generateVerifier()
@@ -63,5 +70,6 @@ object PkceUtil {
         return Base64.encodeToString(hash, BASE64_FLAGS)
     }
 
+    /** URL-safe Base64 without line breaks or padding, per RFC 7636 Appendix A. */
     private const val BASE64_FLAGS = Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
 }

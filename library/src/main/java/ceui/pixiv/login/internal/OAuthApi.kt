@@ -1,6 +1,5 @@
 package ceui.pixiv.login.internal
 
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import retrofit2.Call
 import retrofit2.http.Field
@@ -19,10 +18,28 @@ import retrofit2.http.Url
  *
  * Returns [Call] (not `suspend fun`) because callers include both
  * coroutine code (login flow) and synchronous OkHttp interceptor code
- * (token refresh). `Call.execute()` is the common denominator.
+ * (token refresh from an [okhttp3.Authenticator]). `Call.execute()` is
+ * the common denominator that works in both contexts without
+ * `runBlocking`.
  */
 internal interface OAuthApi {
 
+    /**
+     * Issue a token request.
+     *
+     * This single method serves two mutually exclusive grant types:
+     *
+     * - **Authorization code** (`grant_type=authorization_code`):
+     *   requires [code], [codeVerifier], and [redirectUri];
+     *   [refreshToken] must be `null`.
+     *
+     * - **Refresh token** (`grant_type=refresh_token`):
+     *   requires [refreshToken]; [code], [codeVerifier], and
+     *   [redirectUri] must be `null`.
+     *
+     * Retrofit omits `null` `@Field` values from the form body, so the
+     * unused parameters simply don't appear in the request.
+     */
     @FormUrlEncoded
     @POST
     fun token(
@@ -43,7 +60,8 @@ internal interface OAuthApi {
 //
 // Snake_case field names match the JSON the server returns. These are
 // mapped to the public PixivOAuthResponse / PixivOAuthUser types by
-// PixivOAuthClient before leaving the library boundary.
+// PixivOAuthClient before leaving the library boundary, so callers
+// only ever see idiomatic Kotlin property names.
 
 @Serializable
 internal data class RawTokenResponse(
