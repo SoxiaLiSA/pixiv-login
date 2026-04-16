@@ -43,17 +43,19 @@ Add an intent-filter to the Activity that will receive the login callback:
         <action android:name="android.intent.action.VIEW" />
         <category android:name="android.intent.category.DEFAULT" />
         <category android:name="android.intent.category.BROWSABLE" />
+
+        <!-- ⬇️ scheme must match the config you use ⬇️ -->
+        <!-- PIXIV_ANDROID → "pixiv"      -->
+        <!-- PIXIV_COMIC   → "pixiv-manga" -->
         <data android:scheme="pixiv" />
     </intent-filter>
 </activity>
 ```
 
-| Config | Scheme |
-|---|---|
-| `PixivOAuthConfig.PIXIV_ANDROID` | `pixiv` |
-| `PixivOAuthConfig.PIXIV_COMIC` | `pixiv-manga` |
-
-Using `PIXIV_COMIC`? Change `android:scheme` to `pixiv-manga`.
+| Config | Scheme | `android:scheme` |
+|---|---|---|
+| `PixivOAuthConfig.PIXIV_ANDROID` | `pixiv` | `"pixiv"` |
+| `PixivOAuthConfig.PIXIV_COMIC` | `pixiv-manga` | `"pixiv-manga"` |
 
 ---
 
