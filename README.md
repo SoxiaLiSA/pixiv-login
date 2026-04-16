@@ -65,9 +65,18 @@ Using `PIXIV_COMIC`? Change `android:scheme` to `pixiv-manga`.
 // ① Create client (singleton, keep it alive)
 val client = PixivOAuthClient(PixivOAuthConfig.PIXIV_ANDROID)
 
-// ② Start login — open the URL in Chrome Custom Tab
+// ② Start login — open the URL in a browser
 val url = client.startLogin()
+
+// Option A: Chrome Custom Tab (recommended)
 CustomTabsIntent.Builder().build().launchUrl(context, url.toUri())
+
+// Option B: WebView
+webView.loadUrl(url)
+
+// ⚠️ WebView cannot use Google/Apple/third-party login
+//    (Google blocks OAuth from WebView). Use Chrome Custom Tab
+//    if your users need to log in via Google.
 
 // ③ Handle callback — in your Activity
 override fun onCreate(savedInstanceState: Bundle?) {
@@ -126,6 +135,19 @@ if (response.isExpired(marginMillis = 60_000)) {
     // almost expired
 }
 ```
+
+---
+
+## Chrome Custom Tab vs WebView
+
+| | Chrome Custom Tab | WebView |
+|---|---|---|
+| Google / Apple login | ✅ | ❌ Google blocks OAuth in WebView |
+| Share browser cookies | ✅ | ❌ |
+| UI customization | Limited | Full control |
+| Requires Chrome | Yes | No |
+
+**Recommendation:** Use Chrome Custom Tab. Pixiv supports Google login — if you use WebView, users who log in via Google will see an error page. Only use WebView if you are certain your users will only use Pixiv account + password.
 
 ---
 
