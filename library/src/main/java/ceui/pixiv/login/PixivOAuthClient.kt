@@ -1,5 +1,6 @@
 package ceui.pixiv.login
 
+import android.net.Uri
 import ceui.pixiv.login.internal.OAuthApi
 import ceui.pixiv.login.internal.RawTokenResponse
 import kotlinx.serialization.json.Json
@@ -56,14 +57,22 @@ import java.util.concurrent.TimeUnit
  *
  * // 1. Open the login URL in a Chrome Custom Tab
  * val url = client.startLogin()
+ * CustomTabsIntent.Builder().build().launchUrl(context, url.toUri())
  *
- * // 2. Receive the callback and exchange the code
- * val result = client.handleCallback(code)
- * result.onSuccess { save(it.accessToken, it.refreshToken) }
+ * // 2. In Activity.onNewIntent, handle the callback
+ * val uri = intent?.data ?: return
+ * if (client.isOAuthCallback(uri)) {
+ *     val result = client.handleCallback(uri)
+ *     result.onSuccess { save(it.accessToken, it.refreshToken) }
+ * }
  *
  * // 3. Refresh when the access token expires
  * client.refreshToken(savedRefreshToken)
  * ```
+ *
+ * The caller must register an intent-filter for
+ * [PixivOAuthConfig.callbackScheme] in AndroidManifest.xml so the OS
+ * routes the OAuth redirect back to the app.
  *
  * @param config   identifies which Pixiv product and credentials to use.
  * @param logHttp  enable HTTP body-level logging. Useful during
@@ -136,22 +145,55 @@ class PixivOAuthClient(
     }
 
     /**
-     * Complete the login flow by exchanging the authorization code for
-     * tokens using the PKCE verifier from the most recent [startLogin].
+     * Check whether a [Uri] is an OAuth callback for this client.
+     *
+     * Use this in your Activity's `onCreate` / `onNewIntent` to decide
+     * whether the incoming intent should be routed to [handleCallback]:
+     *
+     * ```kotlin
+     * val uri = intent?.data ?: return
+     * if (client.isOAuthCallback(uri)) {
+     *     lifecycleScope.launch(Dispatchers.IO) {
+     *         client.handleCallback(uri)
+     *             .onSuccess { /* save tokens */ }
+     *     }
+     * }
+     * ```
+     *
+     * Matches when the URI scheme equals [PixivOAuthConfig.callbackScheme]
+     * (e.g. `pixiv`, `pixiv-manga`).
+     */
+    fun isOAuthCallback(uri: Uri): Boolean {
+        return uri.scheme == config.callbackScheme
+    }
+
+    /**
+     * Complete the login flow by extracting the authorization code from
+     * the callback [Uri] and exchanging it for tokens.
      *
      * **Blocking I/O** — call from a background thread.
      *
-     * On success the cached verifier is cleared; on failure it is
-     * preserved so the caller can retry with the same code if desired
-     * (though Pixiv codes are single-use, so a retry would need a
-     * fresh login flow via [startLogin]).
+     * The [uri] is the full callback URI received via intent-filter
+     * (e.g. `pixiv-manga://account/login?code=xxx&via=login`). The
+     * library extracts the `code` query parameter internally — the
+     * caller never needs to parse it.
      *
-     * @param code the authorization code from the callback URI.
+     * On success the cached PKCE verifier is cleared; on failure it is
+     * preserved so a retry is possible (though Pixiv codes are
+     * single-use — a retry would need a fresh [startLogin]).
+     *
+     * @param uri the full callback URI from `intent.data`.
      * @return [PixivOAuthResult.Success] with tokens, or
-     *         [PixivOAuthResult.Failure] if the verifier is missing
-     *         (process died) or the server rejected the exchange.
+     *         [PixivOAuthResult.Failure] if the code is missing, the
+     *         verifier is missing (process died), or the server rejected
+     *         the exchange.
      */
-    fun handleCallback(code: String): PixivOAuthResult {
+    fun handleCallback(uri: Uri): PixivOAuthResult {
+        val code = uri.getQueryParameter("code")
+            ?: return PixivOAuthResult.Failure(
+                httpCode = null,
+                message = "No 'code' query parameter in callback URI: $uri",
+            )
         val verifier = pendingVerifier
             ?: return PixivOAuthResult.Failure(
                 httpCode = null,

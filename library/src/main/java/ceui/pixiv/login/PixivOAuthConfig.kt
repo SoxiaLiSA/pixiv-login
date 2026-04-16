@@ -52,6 +52,12 @@ package ceui.pixiv.login
  *                           Path relative to [oauthBaseUrl] for the token
  *                           endpoint. Pixiv's main app uses `auth/token`;
  *                           Comic uses `v2/auth/token`.
+ * @property callbackScheme  The custom URI scheme the server redirects to
+ *                           after login (e.g. `"pixiv"`, `"pixiv-manga"`).
+ *                           The calling app must register an intent-filter
+ *                           for this scheme so the OS routes the callback
+ *                           back to the app. [PixivOAuthClient.isOAuthCallback]
+ *                           uses this to identify callback URIs.
  * @property oauthBaseUrl    Base URL of the Pixiv OAuth server. All known
  *                           clients share `https://oauth.secure.pixiv.net/`.
  *                           Exposed for forward-compatibility — if Pixiv
@@ -64,6 +70,7 @@ data class PixivOAuthConfig(
     val loginUrl: String,
     val clientParam: String,
     val tokenEndpointPath: String,
+    val callbackScheme: String,
     val oauthBaseUrl: String = DEFAULT_OAUTH_BASE_URL,
 ) {
 
@@ -76,6 +83,10 @@ data class PixivOAuthConfig(
         }
         require(clientParam.isNotBlank()) { "clientParam must not be blank" }
         require(tokenEndpointPath.isNotBlank()) { "tokenEndpointPath must not be blank" }
+        require(callbackScheme.isNotBlank()) { "callbackScheme must not be blank" }
+        require(!callbackScheme.contains("://")) {
+            "callbackScheme should be the scheme only (e.g. \"pixiv\"), not a URI"
+        }
         require(oauthBaseUrl.endsWith("/")) {
             "oauthBaseUrl must end with '/': $oauthBaseUrl"
         }
@@ -99,6 +110,7 @@ data class PixivOAuthConfig(
             loginUrl = "https://app-api.pixiv.net/web/v1/login",
             clientParam = "pixiv-android",
             tokenEndpointPath = "auth/token",
+            callbackScheme = "pixiv",
         )
 
         /**
@@ -121,6 +133,7 @@ data class PixivOAuthConfig(
             loginUrl = "https://comic-api.pixiv.net/web/v1/login",
             clientParam = "comic_ios",
             tokenEndpointPath = "v2/auth/token",
+            callbackScheme = "pixiv-manga",
         )
     }
 }
