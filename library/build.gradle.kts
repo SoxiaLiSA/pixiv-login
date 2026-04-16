@@ -25,6 +25,12 @@ android {
     testOptions {
         unitTests.isIncludeAndroidResources = true
     }
+
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
 }
 
 afterEvaluate {
