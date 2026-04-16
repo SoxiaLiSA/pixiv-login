@@ -27,33 +27,42 @@ import java.util.concurrent.TimeUnit
  *   connection pool shared by high-throughput API calls, so a slow
  *   token endpoint cannot starve image downloads.
  *
+ * ## PKCE lifecycle
+ *
+ * [startLogin] generates a PKCE pair internally and caches the verifier
+ * so the caller never touches it. [handleCallback] consumes the cached
+ * verifier and clears it. If the app process dies between the two calls
+ * (rare — the Chrome Tab round-trip typically takes seconds), the cached
+ * verifier is lost and [handleCallback] returns [PixivOAuthResult.Failure];
+ * the user simply retries login.
+ *
+ * For callers that need to survive process death (e.g. persist the
+ * verifier in MMKV), the lower-level [exchangeCode] accepts an explicit
+ * verifier.
+ *
  * ## Thread safety
  *
- * All public methods are safe to call from any thread. [exchangeCode]
- * and [refreshToken] perform **synchronous** blocking I/O — call them
- * from a background thread or inside `withContext(Dispatchers.IO)`.
- * They are synchronous by design so they can be used both from
- * coroutines and from OkHttp's synchronous [okhttp3.Authenticator]
- * callback without requiring `runBlocking`.
+ * All public methods are safe to call from any thread. [handleCallback],
+ * [exchangeCode], and [refreshToken] perform **synchronous** blocking
+ * I/O — call them from a background thread or inside
+ * `withContext(Dispatchers.IO)`. They are synchronous by design so they
+ * can be used both from coroutines and from OkHttp's synchronous
+ * [okhttp3.Authenticator] callback without requiring `runBlocking`.
  *
  * ## Typical usage
  *
  * ```kotlin
  * val client = PixivOAuthClient(PixivOAuthConfig.PIXIV_ANDROID)
  *
- * // 1. Generate PKCE and open the login URL
- * val pkce = PkceUtil.generate()
- * val url  = client.buildLoginUrl(pkce.challenge)
- * // → open url in Chrome Custom Tab, persist pkce.verifier
+ * // 1. Open the login URL in a Chrome Custom Tab
+ * val url = client.startLogin()
  *
  * // 2. Receive the callback and exchange the code
- * val result = client.exchangeCode(code, savedVerifier)
- * result.onSuccess { response ->
- *     save(response.accessToken, response.refreshToken)
- * }
+ * val result = client.handleCallback(code)
+ * result.onSuccess { save(it.accessToken, it.refreshToken) }
  *
  * // 3. Refresh when the access token expires
- * val refreshResult = client.refreshToken(savedRefreshToken)
+ * client.refreshToken(savedRefreshToken)
  * ```
  *
  * @param config   identifies which Pixiv product and credentials to use.
@@ -93,18 +102,74 @@ class PixivOAuthClient(
         .build()
         .create(OAuthApi::class.java)
 
-    // ── Public API ──────────────────────────────────────────────────
+    /**
+     * Cached PKCE verifier from the most recent [startLogin] call.
+     *
+     * Written by [startLogin], consumed and cleared by [handleCallback].
+     * `@Volatile` is sufficient because transitions are single-writer
+     * (only one login flow at a time) and readers tolerate a brief
+     * stale `null` (it just means "no login in progress").
+     */
+    @Volatile
+    private var pendingVerifier: String? = null
+
+    // ── High-level API ──────────────────────────────────────────────
 
     /**
-     * Build the full login URL to open in a Chrome Custom Tab or WebView.
+     * Start a login flow: generate PKCE, cache the verifier, and return
+     * the login URL to open in a Chrome Custom Tab or WebView.
      *
-     * The returned URL points to the product's login page with the PKCE
-     * [codeChallenge] embedded. After the user authenticates, the server
-     * redirects through the OAuth flow and eventually issues a callback
-     * to a custom scheme (e.g. `pixiv://account/login?code=…`) that the
-     * calling app intercepts via an intent-filter.
+     * After the user authenticates, the server redirects to a custom
+     * scheme (e.g. `pixiv://account/login?code=…`). Intercept that
+     * redirect, extract the `code` query parameter, and pass it to
+     * [handleCallback].
      *
-     * @param codeChallenge the `S256` challenge from [PkceUtil.generate].
+     * Calling [startLogin] again before [handleCallback] discards the
+     * previous PKCE pair — only the most recent login flow is valid.
+     *
+     * @return full login URL ready to open in a browser.
+     */
+    fun startLogin(): String {
+        val pkce = PkceUtil.generate()
+        pendingVerifier = pkce.verifier
+        return buildLoginUrl(pkce.challenge)
+    }
+
+    /**
+     * Complete the login flow by exchanging the authorization code for
+     * tokens using the PKCE verifier from the most recent [startLogin].
+     *
+     * **Blocking I/O** — call from a background thread.
+     *
+     * On success the cached verifier is cleared; on failure it is
+     * preserved so the caller can retry with the same code if desired
+     * (though Pixiv codes are single-use, so a retry would need a
+     * fresh login flow via [startLogin]).
+     *
+     * @param code the authorization code from the callback URI.
+     * @return [PixivOAuthResult.Success] with tokens, or
+     *         [PixivOAuthResult.Failure] if the verifier is missing
+     *         (process died) or the server rejected the exchange.
+     */
+    fun handleCallback(code: String): PixivOAuthResult {
+        val verifier = pendingVerifier
+            ?: return PixivOAuthResult.Failure(
+                httpCode = null,
+                message = "No pending PKCE verifier — did the process restart " +
+                    "between startLogin() and handleCallback()? Call startLogin() again.",
+            )
+        val result = exchangeCode(code, verifier)
+        if (result.isSuccess) pendingVerifier = null
+        return result
+    }
+
+    // ── Low-level API ───────────────────────────────────────────────
+
+    /**
+     * Build the login URL from an explicit [codeChallenge].
+     *
+     * Prefer [startLogin] unless you are managing PKCE persistence
+     * yourself (e.g. surviving process death via MMKV).
      */
     fun buildLoginUrl(codeChallenge: String): String = buildString {
         append(config.loginUrl)
@@ -114,18 +179,17 @@ class PixivOAuthClient(
     }
 
     /**
-     * Exchange an authorization code for an access token and refresh token.
+     * Exchange an authorization code with an explicit PKCE verifier.
+     *
+     * Prefer [handleCallback] unless you are managing PKCE persistence
+     * yourself.
      *
      * **Blocking I/O** — call from a background thread.
      *
-     * @param code         the authorization code extracted from the OAuth
-     *                     callback URI's `code` query parameter.
-     * @param codeVerifier the [PkcePair.verifier] that was generated
-     *                     alongside the challenge used in [buildLoginUrl].
-     *                     Must be the **exact same value** — the server
-     *                     verifies `SHA-256(codeVerifier) == challenge`.
-     * @return [PixivOAuthResult.Success] with tokens, or
-     *         [PixivOAuthResult.Failure] with diagnostic context.
+     * @param code         authorization code from the callback URI.
+     * @param codeVerifier the [PkcePair.verifier] used to build the
+     *                     login URL. The server verifies
+     *                     `SHA-256(codeVerifier) == challenge`.
      */
     fun exchangeCode(code: String, codeVerifier: String): PixivOAuthResult {
         return executeTokenRequest(
@@ -146,7 +210,8 @@ class PixivOAuthClient(
      * token and discard the old one.
      *
      * @param refreshToken the refresh token obtained from a prior
-     *                     [exchangeCode] or [refreshToken] call.
+     *                     [handleCallback], [exchangeCode], or
+     *                     [refreshToken] call.
      * @return [PixivOAuthResult.Success] with fresh tokens, or
      *         [PixivOAuthResult.Failure] if the refresh token is expired
      *         or revoked (typically HTTP 400).
