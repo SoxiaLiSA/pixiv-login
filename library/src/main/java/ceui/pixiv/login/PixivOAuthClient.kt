@@ -10,6 +10,8 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -320,6 +322,38 @@ class PixivOAuthClient(
             refreshToken = refreshToken,
         )
     }
+
+    // ── Suspend API ─────────────────────────────────────────────────
+
+    /**
+     * Suspend variant of [tryHandleCallback].
+     *
+     * Runs the network exchange on [Dispatchers.IO] so it can be called
+     * directly from a lifecycle scope or `ViewModel.viewModelScope`.
+     */
+    suspend fun tryHandleCallbackSuspend(intent: Intent?): PixivOAuthResult? {
+        val uri = intent?.data ?: return null
+        if (!isOAuthCallback(uri)) return null
+        return handleCallbackSuspend(uri)
+    }
+
+    /**
+     * Suspend variant of [handleCallback].
+     */
+    suspend fun handleCallbackSuspend(uri: Uri): PixivOAuthResult =
+        withContext(Dispatchers.IO) { handleCallback(uri) }
+
+    /**
+     * Suspend variant of [exchangeCode].
+     */
+    suspend fun exchangeCodeSuspend(code: String, codeVerifier: String): PixivOAuthResult =
+        withContext(Dispatchers.IO) { exchangeCode(code, codeVerifier) }
+
+    /**
+     * Suspend variant of [refreshToken].
+     */
+    suspend fun refreshTokenSuspend(refreshToken: String): PixivOAuthResult =
+        withContext(Dispatchers.IO) { refreshToken(refreshToken) }
 
     // ── Internals ───────────────────────────────────────────────────
 

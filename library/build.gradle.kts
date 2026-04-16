@@ -47,8 +47,10 @@ dependencies {
     implementation(libs.retrofit.converter.serialization)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp.logging)
+    implementation(libs.kotlinx.coroutines.core)
 
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
     testImplementation(libs.okhttp.mockwebserver)
 }

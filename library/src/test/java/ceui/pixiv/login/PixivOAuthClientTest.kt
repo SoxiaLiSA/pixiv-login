@@ -1,5 +1,6 @@
 package ceui.pixiv.login
 
+import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -276,6 +277,106 @@ class PixivOAuthClientTest {
 
         assertTrue(result.isFailure)
         assertTrue((result as PixivOAuthResult.Failure).message.contains("No pending PKCE verifier"))
+    }
+
+    // ── isExpired with explicit now ─────────────────────────────────
+
+    @Test
+    fun `isExpired returns false when now is before expiry`() {
+        val issued = 1_000_000L
+        val response = PixivOAuthResponse(
+            accessToken = "a", refreshToken = "r", expiresIn = 3600,
+            tokenType = "bearer", scope = "", user = null,
+            issuedAtMillis = issued,
+        )
+        // 1 second before expiry
+        assertFalse(response.isExpired(now = issued + 3599_000L))
+    }
+
+    @Test
+    fun `isExpired returns true when now is at expiry`() {
+        val issued = 1_000_000L
+        val response = PixivOAuthResponse(
+            accessToken = "a", refreshToken = "r", expiresIn = 3600,
+            tokenType = "bearer", scope = "", user = null,
+            issuedAtMillis = issued,
+        )
+        assertTrue(response.isExpired(now = issued + 3600_000L))
+    }
+
+    @Test
+    fun `isExpired respects margin`() {
+        val issued = 1_000_000L
+        val response = PixivOAuthResponse(
+            accessToken = "a", refreshToken = "r", expiresIn = 3600,
+            tokenType = "bearer", scope = "", user = null,
+            issuedAtMillis = issued,
+        )
+        // 60s before actual expiry, but with 60s margin → expired
+        assertTrue(response.isExpired(marginMillis = 60_000, now = issued + 3540_000L))
+        // 61s before actual expiry, with 60s margin → not expired
+        assertFalse(response.isExpired(marginMillis = 60_000, now = issued + 3539_000L))
+    }
+
+    // ── Suspend API ──────────────────────────────────────────────────
+
+    @Test
+    fun `exchangeCodeSuspend returns Success`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        val result = client.exchangeCodeSuspend("code", "verifier")
+        assertTrue(result.isSuccess)
+        assertEquals("access_token_value", (result as PixivOAuthResult.Success).response.accessToken)
+    }
+
+    @Test
+    fun `exchangeCodeSuspend returns Failure on error`() = runTest {
+        server.enqueue(MockResponse().setResponseCode(400).setBody("""{"error":"invalid"}"""))
+
+        val result = client.exchangeCodeSuspend("bad", "verifier")
+        assertTrue(result.isFailure)
+        assertEquals(400, (result as PixivOAuthResult.Failure).httpCode)
+    }
+
+    @Test
+    fun `refreshTokenSuspend returns Success`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        val result = client.refreshTokenSuspend("my-refresh")
+        assertTrue(result.isSuccess)
+    }
+
+    @Test
+    fun `tryHandleCallbackSuspend returns null for null intent`() = runTest {
+        val result = client.tryHandleCallbackSuspend(null)
+        assertNull(result)
+    }
+
+    @Test
+    fun `handleCallbackSuspend exchanges code successfully`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        // Need to startLogin first so verifier is stored
+        client.startLogin()
+
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test-code")
+        val result = client.handleCallbackSuspend(uri)
+        assertTrue(result.isSuccess)
     }
 
     companion object {

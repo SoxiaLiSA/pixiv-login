@@ -61,9 +61,13 @@ data class PixivOAuthResponse(
      *                     treat the token as expired *before* it actually
      *                     expires, giving time to refresh proactively.
      *                     Defaults to `0`.
+     * @param now          current time in milliseconds since epoch.
+     *                     Defaults to [System.currentTimeMillis].
+     *                     Pass an explicit value in tests for
+     *                     deterministic assertions.
      */
-    fun isExpired(marginMillis: Long = 0): Boolean =
-        System.currentTimeMillis() + marginMillis >= expiresAtMillis
+    fun isExpired(marginMillis: Long = 0, now: Long = System.currentTimeMillis()): Boolean =
+        now + marginMillis >= expiresAtMillis
 }
 
 /**
