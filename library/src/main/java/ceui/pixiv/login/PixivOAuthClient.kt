@@ -1,5 +1,6 @@
 package ceui.pixiv.login
 
+import android.content.Intent
 import android.net.Uri
 import ceui.pixiv.login.internal.OAuthApi
 import ceui.pixiv.login.internal.RawTokenResponse
@@ -59,10 +60,9 @@ import java.util.concurrent.TimeUnit
  * val url = client.startLogin()
  * CustomTabsIntent.Builder().build().launchUrl(context, url.toUri())
  *
- * // 2. In Activity.onNewIntent, handle the callback
- * val uri = intent?.data ?: return
- * if (client.isOAuthCallback(uri)) {
- *     val result = client.handleCallback(uri)
+ * // 2. Handle callback in both onCreate and onNewIntent
+ * fun handleIntent(intent: Intent?) {
+ *     val result = client.tryHandleCallback(intent) ?: return
  *     result.onSuccess { save(it.accessToken, it.refreshToken) }
  * }
  *
@@ -165,6 +165,34 @@ class PixivOAuthClient(
      */
     fun isOAuthCallback(uri: Uri): Boolean {
         return uri.scheme == config.callbackScheme
+    }
+
+    /**
+     * If [intent] carries an OAuth callback, exchange the code for tokens
+     * and return the result. Otherwise return `null`.
+     *
+     * Call this from **both** `onCreate` and `onNewIntent` — one line
+     * covers both cold-start and warm-start paths:
+     *
+     * ```kotlin
+     * // In your Activity — works for both onCreate and onNewIntent:
+     * private fun handleIntent(intent: Intent?) {
+     *     val result = client.tryHandleCallback(intent) ?: return
+     *     result.onSuccess { save(it.accessToken) }
+     * }
+     * ```
+     *
+     * **Blocking I/O** — call from a background thread.
+     *
+     * @param intent the incoming intent (may be `null`, may carry a
+     *               non-OAuth URI, or may carry the callback).
+     * @return [PixivOAuthResult] if this was a callback intent,
+     *         `null` if the intent is unrelated to OAuth.
+     */
+    fun tryHandleCallback(intent: Intent?): PixivOAuthResult? {
+        val uri = intent?.data ?: return null
+        if (!isOAuthCallback(uri)) return null
+        return handleCallback(uri)
     }
 
     /**
