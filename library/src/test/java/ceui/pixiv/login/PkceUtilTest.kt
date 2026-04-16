@@ -34,6 +34,18 @@ class PkceUtilTest {
     }
 
     @Test
+    fun `challenge is 43 characters`() {
+        val pair = PkceUtil.generate()
+        assertEquals(43, pair.challenge.length)
+    }
+
+    @Test
+    fun `challenge contains only URL-safe Base64 characters`() {
+        val pair = PkceUtil.generate()
+        assertTrue(pair.challenge.matches(Regex("[A-Za-z0-9_-]+")))
+    }
+
+    @Test
     fun `each call produces a different pair`() {
         val a = PkceUtil.generate()
         val b = PkceUtil.generate()

@@ -52,6 +52,7 @@ object PkceUtil {
      * SHA-256 is guaranteed to be available on all Android devices
      * (it is a mandatory JCA provider), so this method never throws.
      */
+    @JvmStatic
     fun generate(): PkcePair {
         val verifier = generateVerifier()
         val challenge = computeChallenge(verifier)

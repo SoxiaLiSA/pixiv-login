@@ -10,8 +10,10 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+import retrofit2.Callback
+import retrofit2.Response
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -58,6 +60,11 @@ import java.util.concurrent.TimeUnit
  * They are synchronous by design so they can be used both from
  * coroutines and from OkHttp's synchronous [okhttp3.Authenticator]
  * callback without requiring `runBlocking`.
+ *
+ * The suspend variants (`exchangeCodeSuspend`, `refreshTokenSuspend`,
+ * etc.) are **cancellation-aware**: they use [retrofit2.Call.enqueue]
+ * internally, and cancelling the coroutine immediately cancels the
+ * underlying HTTP request via [retrofit2.Call.cancel].
  *
  * The [VerifierStore] is called from whichever thread invokes
  * [startLogin] / [handleCallback]. This is safe under the assumption
@@ -323,13 +330,15 @@ class PixivOAuthClient(
         )
     }
 
-    // ── Suspend API ─────────────────────────────────────────────────
+    // ── Suspend API (cancellation-aware) ───────────────────────────
 
     /**
      * Suspend variant of [tryHandleCallback].
      *
-     * Runs the network exchange on [Dispatchers.IO] so it can be called
-     * directly from a lifecycle scope or `ViewModel.viewModelScope`.
+     * Uses [retrofit2.Call.enqueue] internally so that coroutine
+     * cancellation immediately cancels the underlying HTTP request,
+     * unlike `withContext(Dispatchers.IO)` which would leave the
+     * request running on a blocked thread.
      */
     suspend fun tryHandleCallbackSuspend(intent: Intent?): PixivOAuthResult? {
         val uri = intent?.data ?: return null
@@ -338,25 +347,77 @@ class PixivOAuthClient(
     }
 
     /**
-     * Suspend variant of [handleCallback].
+     * Suspend variant of [handleCallback]. Cancellation-aware.
      */
-    suspend fun handleCallbackSuspend(uri: Uri): PixivOAuthResult =
-        withContext(Dispatchers.IO) { handleCallback(uri) }
+    suspend fun handleCallbackSuspend(uri: Uri): PixivOAuthResult {
+        val code = uri.getQueryParameter("code")
+            ?: return PixivOAuthResult.Failure(
+                httpCode = null,
+                message = "No 'code' query parameter in callback URI: $uri",
+            )
+        val verifier = verifierStore.load()
+            ?: return PixivOAuthResult.Failure(
+                httpCode = null,
+                message = "No pending PKCE verifier — did the process restart " +
+                    "between startLogin() and handleCallback()? Call startLogin() again.",
+            )
+        val result = exchangeCodeSuspend(code, verifier)
+        if (result.isSuccess) verifierStore.clear()
+        return result
+    }
 
     /**
-     * Suspend variant of [exchangeCode].
+     * Suspend variant of [exchangeCode]. Cancellation-aware.
      */
     suspend fun exchangeCodeSuspend(code: String, codeVerifier: String): PixivOAuthResult =
-        withContext(Dispatchers.IO) { exchangeCode(code, codeVerifier) }
+        executeTokenRequestSuspend(
+            grantType = GRANT_TYPE_AUTH_CODE,
+            code = code,
+            codeVerifier = codeVerifier,
+            redirectUri = config.redirectUri,
+        )
 
     /**
-     * Suspend variant of [refreshToken].
+     * Suspend variant of [refreshToken]. Cancellation-aware.
      */
     suspend fun refreshTokenSuspend(refreshToken: String): PixivOAuthResult =
-        withContext(Dispatchers.IO) { refreshToken(refreshToken) }
+        executeTokenRequestSuspend(
+            grantType = GRANT_TYPE_REFRESH_TOKEN,
+            refreshToken = refreshToken,
+        )
 
     // ── Internals ───────────────────────────────────────────────────
 
+    private fun createTokenCall(
+        grantType: String,
+        code: String? = null,
+        codeVerifier: String? = null,
+        refreshToken: String? = null,
+        redirectUri: String? = null,
+    ): retrofit2.Call<RawTokenResponse> = api.token(
+        url = config.tokenEndpointPath,
+        clientId = config.clientId,
+        clientSecret = config.clientSecret,
+        grantType = grantType,
+        code = code,
+        codeVerifier = codeVerifier,
+        refreshToken = refreshToken,
+        redirectUri = redirectUri,
+    )
+
+    private fun mapResponse(response: Response<RawTokenResponse>): PixivOAuthResult {
+        val body = response.body()
+        return if (response.isSuccessful && body != null) {
+            PixivOAuthResult.Success(body.toPublic())
+        } else {
+            PixivOAuthResult.Failure(
+                httpCode = response.code(),
+                message = response.errorBody()?.string() ?: "HTTP ${response.code()}",
+            )
+        }
+    }
+
+    /** Synchronous token request — used by [exchangeCode] and [refreshToken]. */
     private fun executeTokenRequest(
         grantType: String,
         code: String? = null,
@@ -365,26 +426,8 @@ class PixivOAuthClient(
         redirectUri: String? = null,
     ): PixivOAuthResult {
         return try {
-            val response = api.token(
-                url = config.tokenEndpointPath,
-                clientId = config.clientId,
-                clientSecret = config.clientSecret,
-                grantType = grantType,
-                code = code,
-                codeVerifier = codeVerifier,
-                refreshToken = refreshToken,
-                redirectUri = redirectUri,
-            ).execute()
-
-            val body = response.body()
-            if (response.isSuccessful && body != null) {
-                PixivOAuthResult.Success(body.toPublic())
-            } else {
-                PixivOAuthResult.Failure(
-                    httpCode = response.code(),
-                    message = response.errorBody()?.string() ?: "HTTP ${response.code()}",
-                )
-            }
+            val response = createTokenCall(grantType, code, codeVerifier, refreshToken, redirectUri).execute()
+            mapResponse(response)
         } catch (e: IOException) {
             PixivOAuthResult.Failure(
                 httpCode = null,
@@ -397,6 +440,46 @@ class PixivOAuthClient(
                 message = e.message ?: "Unexpected error",
                 cause = e,
             )
+        }
+    }
+
+    /**
+     * Async token request — used by the suspend API. Coroutine cancellation
+     * propagates to [retrofit2.Call.cancel], releasing the connection immediately.
+     */
+    private suspend fun executeTokenRequestSuspend(
+        grantType: String,
+        code: String? = null,
+        codeVerifier: String? = null,
+        refreshToken: String? = null,
+        redirectUri: String? = null,
+    ): PixivOAuthResult {
+        val call = createTokenCall(grantType, code, codeVerifier, refreshToken, redirectUri)
+        return suspendCancellableCoroutine { cont ->
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback<RawTokenResponse> {
+                override fun onResponse(
+                    call: retrofit2.Call<RawTokenResponse>,
+                    response: Response<RawTokenResponse>,
+                ) {
+                    if (cont.isActive) cont.resume(mapResponse(response))
+                }
+
+                override fun onFailure(
+                    call: retrofit2.Call<RawTokenResponse>,
+                    t: Throwable,
+                ) {
+                    if (cont.isActive) {
+                        cont.resume(
+                            PixivOAuthResult.Failure(
+                                httpCode = null,
+                                message = t.message ?: "Network error",
+                                cause = t,
+                            ),
+                        )
+                    }
+                }
+            })
         }
     }
 

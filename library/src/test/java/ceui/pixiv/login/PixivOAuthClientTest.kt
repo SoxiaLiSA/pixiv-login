@@ -1,8 +1,14 @@
 package ceui.pixiv.login
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -13,6 +19,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 class PixivOAuthClientTest {
@@ -377,6 +384,318 @@ class PixivOAuthClientTest {
         val uri = android.net.Uri.parse("pixiv://account/login?code=test-code")
         val result = client.handleCallbackSuspend(uri)
         assertTrue(result.isSuccess)
+    }
+
+    // ── isOAuthCallback ──────────────────────────────────────────────
+
+    @Test
+    fun `isOAuthCallback returns true for matching scheme`() {
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test")
+        assertTrue(client.isOAuthCallback(uri))
+    }
+
+    @Test
+    fun `isOAuthCallback returns false for non-matching scheme`() {
+        val uri = android.net.Uri.parse("https://example.com/callback")
+        assertFalse(client.isOAuthCallback(uri))
+    }
+
+    // ── tryHandleCallback ────────────────────────────────────────────
+
+    @Test
+    fun `tryHandleCallback returns null for null intent`() {
+        assertNull(client.tryHandleCallback(null))
+    }
+
+    @Test
+    fun `tryHandleCallback returns null for intent without data`() {
+        assertNull(client.tryHandleCallback(android.content.Intent()))
+    }
+
+    @Test
+    fun `tryHandleCallback returns null for non-OAuth URI`() {
+        val intent = android.content.Intent().apply {
+            data = android.net.Uri.parse("https://example.com/page")
+        }
+        assertNull(client.tryHandleCallback(intent))
+    }
+
+    @Test
+    fun `tryHandleCallback exchanges code for valid callback`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+        client.startLogin()
+        val intent = android.content.Intent().apply {
+            data = android.net.Uri.parse("pixiv://account/login?code=test-code")
+        }
+        val result = client.tryHandleCallback(intent)
+        assertNotNull(result)
+        assertTrue(result!!.isSuccess)
+    }
+
+    // ── handleCallback edge cases ────────────────────────────────────
+
+    @Test
+    fun `handleCallback fails when code parameter is missing`() {
+        client.startLogin()
+        val uri = android.net.Uri.parse("pixiv://account/login")
+        val result = client.handleCallback(uri)
+        assertTrue(result.isFailure)
+        assertTrue((result as PixivOAuthResult.Failure).message.contains("No 'code'"))
+    }
+
+    @Test
+    fun `handleCallback preserves verifier on exchange failure`() {
+        val store = object : VerifierStore {
+            var saved: String? = null
+            var clearCount = 0
+            override fun save(verifier: String) { saved = verifier }
+            override fun load(): String? = saved
+            override fun clear() { clearCount++; saved = null }
+        }
+        val customClient = PixivOAuthClient(
+            testConfig(server.url("/").toString()),
+            verifierStore = store,
+        )
+        customClient.startLogin()
+
+        server.enqueue(
+            MockResponse().setResponseCode(400).setBody("""{"error":"invalid_grant"}"""),
+        )
+        val uri = android.net.Uri.parse("pixiv://account/login?code=bad-code")
+        val result = customClient.handleCallback(uri)
+
+        assertTrue(result.isFailure)
+        assertEquals(0, store.clearCount)
+        assertNotNull(store.saved)
+    }
+
+    // ── Network error ────────────────────────────────────────────────
+
+    @Test
+    fun `exchangeCode returns Failure on connection reset`() {
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+
+        val result = client.exchangeCode("code", "verifier")
+
+        assertTrue(result.isFailure)
+        val failure = result as PixivOAuthResult.Failure
+        assertNull(failure.httpCode)
+        assertNotNull(failure.cause)
+    }
+
+    // ── refreshToken detailed ────────────────────────────────────────
+
+    @Test
+    fun `refreshToken returns Success with parsed tokens`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        val result = client.refreshToken("old-refresh-token")
+
+        assertTrue(result.isSuccess)
+        val response = (result as PixivOAuthResult.Success).response
+        assertEquals("access_token_value", response.accessToken)
+        assertEquals("refresh_token_value", response.refreshToken)
+    }
+
+    @Test
+    fun `refreshToken returns Failure on HTTP 401`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(401)
+                .setBody("""{"error":"invalid_token"}"""),
+        )
+
+        val result = client.refreshToken("expired-token")
+
+        assertTrue(result.isFailure)
+        assertEquals(401, (result as PixivOAuthResult.Failure).httpCode)
+    }
+
+    // ── PixivOAuthResult chaining ────────────────────────────────────
+
+    @Test
+    fun `onSuccess is not invoked for Failure`() {
+        server.enqueue(MockResponse().setResponseCode(400).setBody("error"))
+
+        var invoked = false
+        client.exchangeCode("code", "verifier")
+            .onSuccess { invoked = true }
+
+        assertFalse(invoked)
+    }
+
+    @Test
+    fun `onFailure is not invoked for Success`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        var invoked = false
+        client.exchangeCode("code", "verifier")
+            .onFailure { invoked = true }
+
+        assertFalse(invoked)
+    }
+
+    @Test
+    fun `onSuccess and onFailure chain on Success`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        var successToken: String? = null
+        var failureInvoked = false
+
+        client.exchangeCode("code", "verifier")
+            .onSuccess { successToken = it.accessToken }
+            .onFailure { failureInvoked = true }
+
+        assertEquals("access_token_value", successToken)
+        assertFalse(failureInvoked)
+    }
+
+    @Test
+    fun `onSuccess and onFailure chain on Failure`() {
+        server.enqueue(MockResponse().setResponseCode(500).setBody("error"))
+
+        var successInvoked = false
+        var failureMsg: String? = null
+
+        client.exchangeCode("code", "verifier")
+            .onSuccess { successInvoked = true }
+            .onFailure { failureMsg = it.message }
+
+        assertFalse(successInvoked)
+        assertNotNull(failureMsg)
+    }
+
+    // ── Suspend edge cases ───────────────────────────────────────────
+
+    @Test
+    fun `tryHandleCallbackSuspend returns null for non-OAuth intent`() = runTest {
+        val intent = android.content.Intent().apply {
+            data = android.net.Uri.parse("https://example.com/page")
+        }
+        assertNull(client.tryHandleCallbackSuspend(intent))
+    }
+
+    @Test
+    fun `handleCallbackSuspend fails when code is missing`() = runTest {
+        client.startLogin()
+        val uri = android.net.Uri.parse("pixiv://account/login")
+        val result = client.handleCallbackSuspend(uri)
+        assertTrue(result.isFailure)
+        assertTrue((result as PixivOAuthResult.Failure).message.contains("No 'code'"))
+    }
+
+    @Test
+    fun `handleCallbackSuspend fails when verifier is missing`() = runTest {
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test")
+        val result = client.handleCallbackSuspend(uri)
+        assertTrue(result.isFailure)
+        assertTrue(
+            (result as PixivOAuthResult.Failure).message.contains("No pending PKCE verifier"),
+        )
+    }
+
+    @Test
+    fun `handleCallbackSuspend clears verifier on success`() = runTest {
+        val store = object : VerifierStore {
+            var saved: String? = null
+            var cleared = false
+            override fun save(verifier: String) { saved = verifier }
+            override fun load(): String? = saved
+            override fun clear() { cleared = true; saved = null }
+        }
+        val customClient = PixivOAuthClient(
+            testConfig(server.url("/").toString()),
+            verifierStore = store,
+        )
+        customClient.startLogin()
+
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test-code")
+        val result = customClient.handleCallbackSuspend(uri)
+
+        assertTrue(result.isSuccess)
+        assertTrue(store.cleared)
+    }
+
+    @Test
+    fun `refreshTokenSuspend returns Failure on HTTP 401`() = runTest {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(401)
+                .setBody("""{"error":"invalid"}"""),
+        )
+
+        val result = client.refreshTokenSuspend("bad-token")
+
+        assertTrue(result.isFailure)
+        assertEquals(401, (result as PixivOAuthResult.Failure).httpCode)
+    }
+
+    @Test
+    fun `exchangeCodeSuspend returns Failure on connection reset`() = runTest {
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START))
+
+        val result = client.exchangeCodeSuspend("code", "verifier")
+
+        assertTrue(result.isFailure)
+        assertNull((result as PixivOAuthResult.Failure).httpCode)
+        assertNotNull(result.cause)
+    }
+
+    // ── Cancellation ─────────────────────────────────────────────────
+
+    @Test
+    fun `exchangeCodeSuspend cancels HTTP request on coroutine cancellation`() = runBlocking {
+        // Use a dedicated server to avoid tearDown issues with pending delayed responses.
+        val delayServer = MockWebServer()
+        delayServer.start()
+        val delayClient = PixivOAuthClient(testConfig(delayServer.url("/").toString()))
+
+        delayServer.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE)
+                .setBodyDelay(10, TimeUnit.SECONDS),
+        )
+
+        val startTime = System.currentTimeMillis()
+        val job = launch(Dispatchers.IO) {
+            delayClient.exchangeCodeSuspend("code", "verifier")
+        }
+
+        delay(300)
+        job.cancelAndJoin()
+
+        val elapsed = System.currentTimeMillis() - startTime
+        assertTrue("Should cancel quickly, took ${elapsed}ms", elapsed < 3000)
+
+        try { delayServer.shutdown() } catch (_: Exception) { }
     }
 
     companion object {
