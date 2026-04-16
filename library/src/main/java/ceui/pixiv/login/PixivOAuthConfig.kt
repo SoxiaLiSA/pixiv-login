@@ -70,6 +70,8 @@ package ceui.pixiv.login
  *                            clients share `https://oauth.secure.pixiv.net/`.
  *                            Exposed for forward-compatibility — if Pixiv
  *                            ever moves the OAuth host, callers can override.
+ *                            HTTP is allowed for local testing (e.g.
+ *                            MockWebServer); production should always use HTTPS.
  */
 data class PixivOAuthConfig(
     val clientId: String,
@@ -104,8 +106,8 @@ data class PixivOAuthConfig(
         require(!callbackScheme.contains("://")) {
             "callbackScheme must be the scheme only (e.g. \"pixiv\"), not a URI: $callbackScheme"
         }
-        require(oauthBaseUrl.startsWith("https://")) {
-            "oauthBaseUrl must use HTTPS: $oauthBaseUrl"
+        require(oauthBaseUrl.startsWith("https://") || oauthBaseUrl.startsWith("http://")) {
+            "oauthBaseUrl must use HTTP(S): $oauthBaseUrl"
         }
         require(oauthBaseUrl.endsWith("/")) {
             "oauthBaseUrl must end with '/': $oauthBaseUrl"
@@ -123,6 +125,7 @@ data class PixivOAuthConfig(
          * - Token endpoint at `auth/token`.
          * - Callback redirects to `pixiv://account/login?code=…`.
          */
+        @JvmField
         val PIXIV_ANDROID = PixivOAuthConfig(
             clientId = "MOBrBDS8blbauoSck0ZfDbtuzpyT",
             clientSecret = "lsACyCD94FhDUtGTXi3QzcFE2uU1hqtDaKeqrdwj",
@@ -146,6 +149,7 @@ data class PixivOAuthConfig(
          * credentials work from any platform — the server does not
          * enforce platform checks.
          */
+        @JvmField
         val PIXIV_COMIC = PixivOAuthConfig(
             clientId = "d9GW1FKXS7iAsrZRh5qp4P7wDjeG",
             clientSecret = "RaMhKgt3LEIVwnhmDkJP1pUrwI2A1vzgHyEJPiCd",

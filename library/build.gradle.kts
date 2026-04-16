@@ -11,6 +11,7 @@ android {
 
     defaultConfig {
         minSdk = 21
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {
@@ -19,6 +20,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = "11"
+    }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
     }
 }
 
@@ -44,5 +49,6 @@ dependencies {
     implementation(libs.okhttp.logging)
 
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
     testImplementation(libs.okhttp.mockwebserver)
 }
