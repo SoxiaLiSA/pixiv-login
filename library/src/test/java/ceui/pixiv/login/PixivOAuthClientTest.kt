@@ -4,6 +4,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -181,6 +182,100 @@ class PixivOAuthClientTest {
             .onFailure { failMsg = it.message }
 
         assertNotNull(failMsg)
+    }
+
+    // ── issuedAtMillis ────────────────────────────────────────────
+
+    @Test
+    fun `response includes issuedAtMillis close to current time`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        val before = System.currentTimeMillis()
+        val result = client.exchangeCode("code", "verifier") as PixivOAuthResult.Success
+        val after = System.currentTimeMillis()
+
+        assertTrue(result.response.issuedAtMillis in before..after)
+    }
+
+    @Test
+    fun `expiresAtMillis equals issuedAtMillis plus expiresIn seconds`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        val response = (client.exchangeCode("code", "verifier") as PixivOAuthResult.Success).response
+        assertEquals(
+            response.issuedAtMillis + response.expiresIn * 1000L,
+            response.expiresAtMillis,
+        )
+    }
+
+    @Test
+    fun `freshly issued token is not expired`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        val response = (client.exchangeCode("code", "verifier") as PixivOAuthResult.Success).response
+        assertFalse(response.isExpired())
+    }
+
+    // ── VerifierStore ─────────────────────────────────────────────
+
+    @Test
+    fun `custom VerifierStore is used for startLogin and handleCallback`() {
+        val store = object : VerifierStore {
+            var saved: String? = null
+            var cleared = false
+            override fun save(verifier: String) { saved = verifier }
+            override fun load(): String? = saved
+            override fun clear() { cleared = true; saved = null }
+        }
+
+        val customClient = PixivOAuthClient(testConfig(server.url("/").toString()), verifierStore = store)
+
+        // startLogin should save the verifier
+        customClient.startLogin()
+        assertNotNull(store.saved)
+
+        // handleCallback with a successful exchange should clear it
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test-code")
+        val result = customClient.handleCallback(uri)
+        assertTrue(result.isSuccess)
+        assertTrue(store.cleared)
+    }
+
+    @Test
+    fun `handleCallback fails when VerifierStore returns null`() {
+        val emptyStore = object : VerifierStore {
+            override fun save(verifier: String) {}
+            override fun load(): String? = null
+            override fun clear() {}
+        }
+
+        val customClient = PixivOAuthClient(testConfig(server.url("/").toString()), verifierStore = emptyStore)
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test-code")
+        val result = customClient.handleCallback(uri)
+
+        assertTrue(result.isFailure)
+        assertTrue((result as PixivOAuthResult.Failure).message.contains("No pending PKCE verifier"))
     }
 
     companion object {

@@ -31,16 +31,19 @@ import java.util.concurrent.TimeUnit
  *
  * ## PKCE lifecycle
  *
- * [startLogin] generates a PKCE pair internally and caches the verifier
- * so the caller never touches it. [handleCallback] / [tryHandleCallback]
- * consumes the cached verifier and clears it. If the app process dies
- * between the two calls (rare — the Chrome Tab round-trip typically
- * takes seconds), the cached verifier is lost and [handleCallback]
- * returns [PixivOAuthResult.Failure]; the user simply retries login.
+ * [startLogin] generates a PKCE pair internally and stores the verifier
+ * via [VerifierStore] so the caller never touches it. [handleCallback] /
+ * [tryHandleCallback] loads and consumes the stored verifier.
  *
- * For callers that need to survive process death (e.g. persist the
- * verifier in MMKV), the lower-level [buildLoginUrl] + [exchangeCode]
- * pair accepts an explicit verifier.
+ * By default, the verifier is held in memory ([InMemoryVerifierStore]).
+ * If the app process dies between [startLogin] and [handleCallback]
+ * (rare — the Chrome Tab round-trip typically takes seconds), the
+ * verifier is lost. To survive process death, pass a persistent
+ * [VerifierStore] implementation (e.g. backed by MMKV or
+ * SharedPreferences) to the constructor.
+ *
+ * For callers that need even more control, the lower-level
+ * [buildLoginUrl] + [exchangeCode] pair accepts an explicit verifier.
  *
  * ## Thread safety
  *
@@ -54,12 +57,12 @@ import java.util.concurrent.TimeUnit
  * coroutines and from OkHttp's synchronous [okhttp3.Authenticator]
  * callback without requiring `runBlocking`.
  *
- * The internal PKCE cache ([pendingVerifier]) uses a single `@Volatile`
- * field. This is safe under the assumption that only **one login flow
- * is in progress at a time** — the normal case for interactive login.
- * Concurrent [startLogin] calls race on the write, and the last writer
- * wins; this is acceptable because the user can only be on one login
- * page at once.
+ * The [VerifierStore] is called from whichever thread invokes
+ * [startLogin] / [handleCallback]. This is safe under the assumption
+ * that only **one login flow is in progress at a time** — the normal
+ * case for interactive login. Concurrent [startLogin] calls race on
+ * the write, and the last writer wins; this is acceptable because
+ * the user can only be on one login page at once.
  *
  * ## Lifecycle
  *
@@ -92,21 +95,26 @@ import java.util.concurrent.TimeUnit
  * [PixivOAuthConfig.callbackScheme] in AndroidManifest.xml so the OS
  * routes the OAuth redirect back to the app.
  *
- * @param config     identifies which Pixiv product and credentials to use.
- * @param baseClient optional [OkHttpClient] to derive from. The client
- *                   calls [OkHttpClient.newBuilder] on it and applies
- *                   timeouts, so the caller's interceptors (Chucker,
- *                   custom DNS, etc.) are inherited without mutation.
- *                   Pass `null` (the default) to create a standalone
- *                   client with no shared interceptors.
- * @param logHttp    enable HTTP body-level logging. Useful during
- *                   development; **disable in production** to avoid
- *                   leaking tokens and secrets to logcat.
+ * @param config        identifies which Pixiv product and credentials to use.
+ * @param baseClient    optional [OkHttpClient] to derive from. The client
+ *                      calls [OkHttpClient.newBuilder] on it and applies
+ *                      timeouts, so the caller's interceptors (Chucker,
+ *                      custom DNS, etc.) are inherited without mutation.
+ *                      Pass `null` (the default) to create a standalone
+ *                      client with no shared interceptors.
+ * @param logHttp       enable HTTP body-level logging. Useful during
+ *                      development; **disable in production** to avoid
+ *                      leaking tokens and secrets to logcat.
+ * @param verifierStore storage strategy for the PKCE verifier between
+ *                      [startLogin] and [handleCallback]. Defaults to
+ *                      an in-memory store; pass a persistent implementation
+ *                      to survive process death. See [VerifierStore].
  */
 class PixivOAuthClient(
     val config: PixivOAuthConfig,
     baseClient: OkHttpClient? = null,
     logHttp: Boolean = false,
+    private val verifierStore: VerifierStore = InMemoryVerifierStore(),
 ) {
 
     private val json = Json {
@@ -136,16 +144,7 @@ class PixivOAuthClient(
         .build()
         .create(OAuthApi::class.java)
 
-    /**
-     * Cached PKCE verifier from the most recent [startLogin] call.
-     *
-     * Written by [startLogin], consumed and cleared by [handleCallback].
-     * `@Volatile` is sufficient because transitions are single-writer
-     * (only one login flow at a time) and readers tolerate a brief
-     * stale `null` (it just means "no login in progress").
-     */
-    @Volatile
-    private var pendingVerifier: String? = null
+    // PKCE verifier is managed by verifierStore — see VerifierStore docs.
 
     // ── High-level API ──────────────────────────────────────────────
 
@@ -165,7 +164,7 @@ class PixivOAuthClient(
      */
     fun startLogin(): String {
         val pkce = PkceUtil.generate()
-        pendingVerifier = pkce.verifier
+        verifierStore.save(pkce.verifier)
         return buildLoginUrl(pkce.challenge)
     }
 
@@ -246,14 +245,14 @@ class PixivOAuthClient(
                 httpCode = null,
                 message = "No 'code' query parameter in callback URI: $uri",
             )
-        val verifier = pendingVerifier
+        val verifier = verifierStore.load()
             ?: return PixivOAuthResult.Failure(
                 httpCode = null,
                 message = "No pending PKCE verifier — did the process restart " +
                     "between startLogin() and handleCallback()? Call startLogin() again.",
             )
         val result = exchangeCode(code, verifier)
-        if (result.isSuccess) pendingVerifier = null
+        if (result.isSuccess) verifierStore.clear()
         return result
     }
 
@@ -268,12 +267,14 @@ class PixivOAuthClient(
      * The [codeChallenge] is produced by [PkceUtil.generate] and is
      * already URL-safe Base64 — no additional encoding is applied.
      */
-    fun buildLoginUrl(codeChallenge: String): String = buildString {
-        append(config.loginUrl)
-        append("?code_challenge=").append(codeChallenge)
-        append("&code_challenge_method=S256")
-        append("&client=").append(config.clientParam)
-    }
+    fun buildLoginUrl(codeChallenge: String): String =
+        Uri.parse(config.loginUrl)
+            .buildUpon()
+            .appendQueryParameter("code_challenge", codeChallenge)
+            .appendQueryParameter("code_challenge_method", "S256")
+            .appendQueryParameter("client", config.clientParam)
+            .build()
+            .toString()
 
     /**
      * Exchange an authorization code with an explicit PKCE verifier.
@@ -383,4 +384,5 @@ internal fun RawTokenResponse.toPublic() = PixivOAuthResponse(
     user = user?.let {
         PixivOAuthUser(id = it.id, name = it.name, account = it.account)
     },
+    issuedAtMillis = System.currentTimeMillis(),
 )
