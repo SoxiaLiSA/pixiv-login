@@ -40,7 +40,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.CeuiLiSA"
                 artifactId = "pixiv-login"
-                version = "1.0.0"
+                version = "1.1.0"
             }
         }
     }
@@ -50,7 +50,6 @@ dependencies {
     api(libs.okhttp)
 
     implementation(libs.retrofit)
-    implementation(libs.retrofit.converter.serialization)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp.logging)
     implementation(libs.kotlinx.coroutines.core)

@@ -5,11 +5,10 @@ import android.net.Uri
 import ceui.pixiv.login.internal.OAuthApi
 import ceui.pixiv.login.internal.RawTokenResponse
 import kotlinx.serialization.json.Json
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.ResponseBody
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
-import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 import retrofit2.Callback
@@ -149,7 +148,6 @@ class PixivOAuthClient(
     private val api: OAuthApi = Retrofit.Builder()
         .baseUrl(config.oauthBaseUrl)
         .client(httpClient)
-        .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
         .build()
         .create(OAuthApi::class.java)
 
@@ -175,6 +173,24 @@ class PixivOAuthClient(
         val pkce = PkceUtil.generate()
         verifierStore.save(pkce.verifier)
         return buildLoginUrl(pkce.challenge)
+    }
+
+    /**
+     * Start a provisional-account creation flow: generate PKCE, cache
+     * the verifier, and return the URL to open in a Chrome Custom Tab
+     * or WebView.
+     *
+     * A provisional account lets the user browse Pixiv without
+     * registering. The callback and token exchange are identical to
+     * [startLogin] — use the same [tryHandleCallback] /
+     * [handleCallback] to complete the flow.
+     *
+     * @return full provisional-account URL ready to open in a browser.
+     */
+    fun startProvisionalAccount(): String {
+        val pkce = PkceUtil.generate()
+        verifierStore.save(pkce.verifier)
+        return buildProvisionalAccountUrl(pkce.challenge)
     }
 
     /**
@@ -278,6 +294,21 @@ class PixivOAuthClient(
      */
     fun buildLoginUrl(codeChallenge: String): String =
         Uri.parse(config.loginUrl)
+            .buildUpon()
+            .appendQueryParameter("code_challenge", codeChallenge)
+            .appendQueryParameter("code_challenge_method", "S256")
+            .appendQueryParameter("client", config.clientParam)
+            .build()
+            .toString()
+
+    /**
+     * Build the provisional-account URL from an explicit [codeChallenge].
+     *
+     * Prefer [startProvisionalAccount] unless you are managing PKCE
+     * persistence yourself.
+     */
+    fun buildProvisionalAccountUrl(codeChallenge: String): String =
+        Uri.parse(config.provisionalAccountUrl)
             .buildUpon()
             .appendQueryParameter("code_challenge", codeChallenge)
             .appendQueryParameter("code_challenge_method", "S256")
@@ -394,7 +425,7 @@ class PixivOAuthClient(
         codeVerifier: String? = null,
         refreshToken: String? = null,
         redirectUri: String? = null,
-    ): retrofit2.Call<RawTokenResponse> = api.token(
+    ): retrofit2.Call<ResponseBody> = api.token(
         url = config.tokenEndpointPath,
         clientId = config.clientId,
         clientSecret = config.clientSecret,
@@ -405,14 +436,29 @@ class PixivOAuthClient(
         redirectUri = redirectUri,
     )
 
-    private fun mapResponse(response: Response<RawTokenResponse>): PixivOAuthResult {
-        val body = response.body()
-        return if (response.isSuccessful && body != null) {
-            PixivOAuthResult.Success(body.toPublic())
-        } else {
-            PixivOAuthResult.Failure(
+    private fun mapResponse(response: Response<ResponseBody>): PixivOAuthResult {
+        if (!response.isSuccessful) {
+            return PixivOAuthResult.Failure(
                 httpCode = response.code(),
                 message = response.errorBody()?.string() ?: "HTTP ${response.code()}",
+            )
+        }
+        val rawBody = response.body()?.string()
+            ?: return PixivOAuthResult.Failure(
+                httpCode = response.code(),
+                message = "Empty response body",
+            )
+        return try {
+            val parsed = json.decodeFromString<RawTokenResponse>(rawBody)
+            PixivOAuthResult.Success(
+                response = parsed.toPublic(),
+                rawBody = rawBody,
+            )
+        } catch (e: Exception) {
+            PixivOAuthResult.Failure(
+                httpCode = response.code(),
+                message = "Failed to parse response: ${e.message}",
+                cause = e,
             )
         }
     }
@@ -457,16 +503,16 @@ class PixivOAuthClient(
         val call = createTokenCall(grantType, code, codeVerifier, refreshToken, redirectUri)
         return suspendCancellableCoroutine { cont ->
             cont.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback<RawTokenResponse> {
+            call.enqueue(object : Callback<ResponseBody> {
                 override fun onResponse(
-                    call: retrofit2.Call<RawTokenResponse>,
-                    response: Response<RawTokenResponse>,
+                    call: retrofit2.Call<ResponseBody>,
+                    response: Response<ResponseBody>,
                 ) {
                     if (cont.isActive) cont.resume(mapResponse(response))
                 }
 
                 override fun onFailure(
-                    call: retrofit2.Call<RawTokenResponse>,
+                    call: retrofit2.Call<ResponseBody>,
                     t: Throwable,
                 ) {
                     if (cont.isActive) {

@@ -1,6 +1,7 @@
 package ceui.pixiv.login.internal
 
 import kotlinx.serialization.Serializable
+import okhttp3.ResponseBody
 import retrofit2.Call
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
@@ -16,11 +17,13 @@ import retrofit2.http.Url
  * a different token endpoint path without creating multiple Retrofit
  * service instances.
  *
- * Returns [Call] (not `suspend fun`) because callers include both
- * coroutine code (login flow) and synchronous OkHttp interceptor code
- * (token refresh from an [okhttp3.Authenticator]). `Call.execute()` is
- * the common denominator that works in both contexts without
- * `runBlocking`.
+ * Returns [Call]<[ResponseBody]> (not a typed model) so that
+ * [ceui.pixiv.login.PixivOAuthClient] can capture the raw JSON body
+ * **and** parse it into [RawTokenResponse]. The raw body is exposed
+ * to callers via [ceui.pixiv.login.PixivOAuthResult.Success.rawBody],
+ * allowing them to re-deserialize into richer application-specific
+ * types (e.g. a `UserModel` with full profile data) without bypassing
+ * the library's PKCE and callback management.
  */
 internal interface OAuthApi {
 
@@ -53,7 +56,7 @@ internal interface OAuthApi {
         @Field("redirect_uri") redirectUri: String? = null,
         @Field("include_policy") includePolicy: Boolean = true,
         @Field("get_secure_url") getSecureUrl: Boolean = true,
-    ): Call<RawTokenResponse>
+    ): Call<ResponseBody>
 }
 
 // ── Wire-format models ──────────────────────────────────────────────

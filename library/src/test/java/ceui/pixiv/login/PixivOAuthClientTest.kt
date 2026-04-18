@@ -69,6 +69,42 @@ class PixivOAuthClientTest {
         assertTrue(url.contains("client=pixiv-android"))
     }
 
+    // ── startProvisionalAccount / buildProvisionalAccountUrl ──────
+
+    @Test
+    fun `startProvisionalAccount returns URL with PKCE challenge`() {
+        val url = client.startProvisionalAccount()
+        assertTrue(url.contains("provisional-accounts/create"))
+        assertTrue(url.contains("code_challenge="))
+        assertTrue(url.contains("code_challenge_method=S256"))
+        assertTrue(url.contains("client=pixiv-android"))
+    }
+
+    @Test
+    fun `buildProvisionalAccountUrl includes all required params`() {
+        val url = client.buildProvisionalAccountUrl("test-challenge")
+        assertTrue(url.contains("provisional-accounts/create"))
+        assertTrue(url.contains("code_challenge=test-challenge"))
+        assertTrue(url.contains("code_challenge_method=S256"))
+        assertTrue(url.contains("client=pixiv-android"))
+    }
+
+    @Test
+    fun `startProvisionalAccount stores verifier for handleCallback`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        client.startProvisionalAccount()
+
+        val uri = android.net.Uri.parse("pixiv://account/login?code=test-code")
+        val result = client.handleCallback(uri)
+        assertTrue(result.isSuccess)
+    }
+
     // ── exchangeCode ───────────────────────────────────────────────
 
     @Test
@@ -88,6 +124,22 @@ class PixivOAuthClientTest {
         assertEquals("refresh_token_value", response.refreshToken)
         assertEquals(3600, response.expiresIn)
         assertEquals("bearer", response.tokenType)
+    }
+
+    @Test
+    fun `exchangeCode exposes rawBody for custom deserialization`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(TOKEN_RESPONSE_WITH_USER),
+        )
+
+        val result = client.exchangeCode("code", "verifier") as PixivOAuthResult.Success
+        // rawBody contains the original JSON — callers can re-parse into richer types
+        assertTrue(result.rawBody.contains("\"access_token\""))
+        assertTrue(result.rawBody.contains("\"user\""))
+        assertTrue(result.rawBody.contains("\"testuser\""))
     }
 
     @Test

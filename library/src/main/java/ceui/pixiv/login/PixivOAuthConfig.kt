@@ -47,6 +47,14 @@ package ceui.pixiv.login
  *                            `https://app-api.pixiv.net/web/v1/login`).
  *                            [PixivOAuthClient.buildLoginUrl] appends query
  *                            parameters to this URL.
+ * @property provisionalAccountUrl
+ *                            Base URL for creating a provisional (temporary)
+ *                            account, e.g.
+ *                            `https://app-api.pixiv.net/web/v1/provisional-accounts/create`.
+ *                            The query parameters and callback flow are
+ *                            identical to [loginUrl]. Defaults to replacing
+ *                            the `/login` suffix of [loginUrl] with
+ *                            `/provisional-accounts/create`.
  * @property clientParam      The `client` query-parameter value appended to
  *                            the login URL. Tells the server which platform
  *                            variant to serve (e.g. `pixiv-android`,
@@ -78,6 +86,7 @@ data class PixivOAuthConfig(
     val clientSecret: String,
     val redirectUri: String,
     val loginUrl: String,
+    val provisionalAccountUrl: String = loginUrl.replace("/login", "/provisional-accounts/create"),
     val clientParam: String,
     val tokenEndpointPath: String,
     val callbackScheme: String,
@@ -95,6 +104,12 @@ data class PixivOAuthConfig(
         }
         require(!loginUrl.contains('?')) {
             "loginUrl must not contain query parameters (they are appended by buildLoginUrl): $loginUrl"
+        }
+        require(provisionalAccountUrl.startsWith("https://")) {
+            "provisionalAccountUrl must use HTTPS: $provisionalAccountUrl"
+        }
+        require(!provisionalAccountUrl.contains('?')) {
+            "provisionalAccountUrl must not contain query parameters: $provisionalAccountUrl"
         }
         require(clientParam.isNotBlank()) { "clientParam must not be blank" }
         require(tokenEndpointPath.isNotBlank()) { "tokenEndpointPath must not be blank" }

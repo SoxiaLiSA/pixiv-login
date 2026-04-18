@@ -39,8 +39,17 @@ sealed class PixivOAuthResult {
      *
      * @property response parsed token response with [PixivOAuthResponse.accessToken],
      *                    [PixivOAuthResponse.refreshToken], and optional user profile.
+     * @property rawBody  the raw JSON response body from the server. Callers
+     *                    that need fields beyond what [PixivOAuthResponse]
+     *                    exposes (e.g. a full user profile with R18 settings,
+     *                    `device_token`, etc.) can re-deserialize this into
+     *                    their own richer model type using Gson / Moshi /
+     *                    kotlinx.serialization.
      */
-    data class Success(val response: PixivOAuthResponse) : PixivOAuthResult()
+    data class Success(
+        val response: PixivOAuthResponse,
+        val rawBody: String,
+    ) : PixivOAuthResult()
 
     /**
      * The request failed — either the server rejected it or a network /
