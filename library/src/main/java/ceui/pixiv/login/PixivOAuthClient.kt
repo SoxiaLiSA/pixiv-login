@@ -5,6 +5,8 @@ import android.net.Uri
 import ceui.pixiv.login.internal.OAuthApi
 import ceui.pixiv.login.internal.RawTokenResponse
 import kotlinx.serialization.json.Json
+import android.os.Build
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.ResponseBody
 import okhttp3.logging.HttpLoggingInterceptor
@@ -14,6 +16,10 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import retrofit2.Callback
 import retrofit2.Response
 import java.io.IOException
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -103,24 +109,30 @@ import java.util.concurrent.TimeUnit
  * [PixivOAuthConfig.callbackScheme] in AndroidManifest.xml so the OS
  * routes the OAuth redirect back to the app.
  *
- * @param config        identifies which Pixiv product and credentials to use.
- * @param baseClient    optional [OkHttpClient] to derive from. The client
- *                      calls [OkHttpClient.newBuilder] on it and applies
- *                      timeouts, so the caller's interceptors (Chucker,
- *                      custom DNS, etc.) are inherited without mutation.
- *                      Pass `null` (the default) to create a standalone
- *                      client with no shared interceptors.
- * @param logHttp       enable HTTP body-level logging. Useful during
- *                      development; **disable in production** to avoid
- *                      leaking tokens and secrets to logcat.
- * @param verifierStore storage strategy for the PKCE verifier between
- *                      [startLogin] and [handleCallback]. Defaults to
- *                      an in-memory store; pass a persistent implementation
- *                      to survive process death. See [VerifierStore].
+ * @param config           identifies which Pixiv product and credentials to use.
+ * @param baseClient       optional [OkHttpClient] to derive from. The client
+ *                         calls [OkHttpClient.newBuilder] on it and applies
+ *                         timeouts, so the caller's interceptors (Chucker,
+ *                         custom DNS, etc.) are inherited without mutation.
+ *                         Pass `null` (the default) to create a standalone
+ *                         client with no shared interceptors.
+ * @param addDefaultHeaders when `true` (the default), the client adds standard
+ *                         Pixiv request headers (`User-Agent`, `App-OS`,
+ *                         `X-Client-Time`, `X-Client-Hash`) to every request.
+ *                         Set to `false` if you supply your own header
+ *                         interceptor via [baseClient].
+ * @param logHttp          enable HTTP body-level logging. Useful during
+ *                         development; **disable in production** to avoid
+ *                         leaking tokens and secrets to logcat.
+ * @param verifierStore    storage strategy for the PKCE verifier between
+ *                         [startLogin] and [handleCallback]. Defaults to
+ *                         an in-memory store; pass a persistent implementation
+ *                         to survive process death. See [VerifierStore].
  */
 class PixivOAuthClient(
-    val config: PixivOAuthConfig,
+    internal val config: PixivOAuthConfig,
     baseClient: OkHttpClient? = null,
+    addDefaultHeaders: Boolean = true,
     logHttp: Boolean = false,
     private val verifierStore: VerifierStore = InMemoryVerifierStore(),
 ) {
@@ -135,6 +147,9 @@ class PixivOAuthClient(
         .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .writeTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .apply {
+            if (addDefaultHeaders) {
+                addInterceptor(createDefaultHeaderInterceptor())
+            }
             if (logHttp) {
                 addInterceptor(
                     HttpLoggingInterceptor().apply {
@@ -266,13 +281,11 @@ class PixivOAuthClient(
      */
     fun handleCallback(uri: Uri): PixivOAuthResult {
         val code = uri.getQueryParameter("code")
-            ?: return PixivOAuthResult.Failure(
-                httpCode = null,
+            ?: return PixivOAuthResult.Failure.MissingCode(
                 message = "No 'code' query parameter in callback URI: $uri",
             )
         val verifier = verifierStore.load()
-            ?: return PixivOAuthResult.Failure(
-                httpCode = null,
+            ?: return PixivOAuthResult.Failure.MissingVerifier(
                 message = "No pending PKCE verifier — did the process restart " +
                     "between startLogin() and handleCallback()? Call startLogin() again.",
             )
@@ -382,13 +395,11 @@ class PixivOAuthClient(
      */
     suspend fun handleCallbackSuspend(uri: Uri): PixivOAuthResult {
         val code = uri.getQueryParameter("code")
-            ?: return PixivOAuthResult.Failure(
-                httpCode = null,
+            ?: return PixivOAuthResult.Failure.MissingCode(
                 message = "No 'code' query parameter in callback URI: $uri",
             )
         val verifier = verifierStore.load()
-            ?: return PixivOAuthResult.Failure(
-                httpCode = null,
+            ?: return PixivOAuthResult.Failure.MissingVerifier(
                 message = "No pending PKCE verifier — did the process restart " +
                     "between startLogin() and handleCallback()? Call startLogin() again.",
             )
@@ -438,13 +449,13 @@ class PixivOAuthClient(
 
     private fun mapResponse(response: Response<ResponseBody>): PixivOAuthResult {
         if (!response.isSuccessful) {
-            return PixivOAuthResult.Failure(
+            return PixivOAuthResult.Failure.ServerRejected(
                 httpCode = response.code(),
                 message = response.errorBody()?.string() ?: "HTTP ${response.code()}",
             )
         }
         val rawBody = response.body()?.string()
-            ?: return PixivOAuthResult.Failure(
+            ?: return PixivOAuthResult.Failure.ServerRejected(
                 httpCode = response.code(),
                 message = "Empty response body",
             )
@@ -455,7 +466,7 @@ class PixivOAuthClient(
                 rawBody = rawBody,
             )
         } catch (e: Exception) {
-            PixivOAuthResult.Failure(
+            PixivOAuthResult.Failure.ServerRejected(
                 httpCode = response.code(),
                 message = "Failed to parse response: ${e.message}",
                 cause = e,
@@ -475,14 +486,12 @@ class PixivOAuthClient(
             val response = createTokenCall(grantType, code, codeVerifier, refreshToken, redirectUri).execute()
             mapResponse(response)
         } catch (e: IOException) {
-            PixivOAuthResult.Failure(
-                httpCode = null,
+            PixivOAuthResult.Failure.NetworkError(
                 message = e.message ?: "Network error",
                 cause = e,
             )
         } catch (e: Exception) {
-            PixivOAuthResult.Failure(
-                httpCode = null,
+            PixivOAuthResult.Failure.NetworkError(
                 message = e.message ?: "Unexpected error",
                 cause = e,
             )
@@ -517,8 +526,7 @@ class PixivOAuthClient(
                 ) {
                     if (cont.isActive) {
                         cont.resume(
-                            PixivOAuthResult.Failure(
-                                httpCode = null,
+                            PixivOAuthResult.Failure.NetworkError(
                                 message = t.message ?: "Network error",
                                 cause = t,
                             ),
@@ -529,10 +537,46 @@ class PixivOAuthClient(
         }
     }
 
+    private fun createDefaultHeaderInterceptor(): Interceptor = Interceptor { chain ->
+        val request = chain.request()
+        val clientTime = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US)
+            .format(Date())
+        val hash = md5(clientTime + HASH_SECRET)
+
+        val builder = request.newBuilder()
+        if (request.header("User-Agent") == null) {
+            builder.header(
+                "User-Agent",
+                "PixivAndroidApp/5.0.234 (Android ${Build.VERSION.RELEASE}; ${Build.MODEL})",
+            )
+        }
+        if (request.header("App-OS") == null) {
+            builder.header("App-OS", "android")
+        }
+        if (request.header("App-OS-Version") == null) {
+            builder.header("App-OS-Version", Build.VERSION.RELEASE)
+        }
+        if (request.header("X-Client-Time") == null) {
+            builder.header("X-Client-Time", clientTime)
+        }
+        if (request.header("X-Client-Hash") == null) {
+            builder.header("X-Client-Hash", hash)
+        }
+        chain.proceed(builder.build())
+    }
+
     private companion object {
         private const val TIMEOUT_SECONDS = 15L
         private const val GRANT_TYPE_AUTH_CODE = "authorization_code"
         private const val GRANT_TYPE_REFRESH_TOKEN = "refresh_token"
+        private const val HASH_SECRET =
+            "28c1fdd170a5204386cb1313c7077b34f83e4aaf4aa829ce78c231e05b0bae2c"
+
+        private fun md5(input: String): String {
+            val digest = MessageDigest.getInstance("MD5")
+            return digest.digest(input.toByteArray())
+                .joinToString("") { "%02x".format(it) }
+        }
     }
 }
 

@@ -10,9 +10,11 @@ package ceui.pixiv.login
  * when (val result = client.handleCallback(uri)) {
  *     is PixivOAuthResult.Success -> {
  *         save(result.response.accessToken, result.response.refreshToken)
+ *         // rawBody is available for custom deserialization
+ *         val fullProfile = gson.fromJson(result.rawBody, MyRichResponse::class.java)
  *     }
  *     is PixivOAuthResult.Failure -> {
- *         Log.e(TAG, "OAuth failed: HTTP ${result.httpCode} — ${result.message}", result.cause)
+ *         Log.e(TAG, "OAuth failed: ${result.message}", result.cause)
  *     }
  * }
  * ```
@@ -21,8 +23,21 @@ package ceui.pixiv.login
  *
  * ```kotlin
  * client.handleCallback(uri)
- *     .onSuccess { save(it.accessToken, it.refreshToken) }
+ *     .onSuccess { save(it.response.accessToken, it.rawBody) }
  *     .onFailure { Log.e(TAG, it.message, it.cause) }
+ * ```
+ *
+ * Failure subtypes allow structured error handling without string matching:
+ *
+ * ```kotlin
+ * result.onFailure { failure ->
+ *     when (failure) {
+ *         is Failure.MissingVerifier -> showLoginExpiredDialog()
+ *         is Failure.MissingCode     -> showCallbackErrorDialog()
+ *         is Failure.ServerRejected  -> log("HTTP ${failure.httpCode}: ${failure.message}")
+ *         is Failure.NetworkError    -> showRetryDialog()
+ *     }
+ * }
  * ```
  *
  * ## Why not `kotlin.Result`?
@@ -52,28 +67,69 @@ sealed class PixivOAuthResult {
     ) : PixivOAuthResult()
 
     /**
-     * The request failed — either the server rejected it or a network /
-     * serialisation error occurred.
+     * The request failed. Match on the sealed subtypes to distinguish
+     * failure reasons without string matching:
      *
-     * @property httpCode HTTP status code if the server responded (e.g. 400,
-     *                    401, 403). `null` when the failure happened before
-     *                    a response was received (DNS, TLS, timeout) or when
-     *                    the error is purely client-side (missing PKCE verifier).
-     * @property message  Human-readable description. For server errors this
-     *                    is the raw error body; for transport errors it is
-     *                    the exception message. Suitable for debug logging,
-     *                    **not** for user-facing UI.
-     * @property cause    The underlying exception, if any. `null` for
-     *                    server-side rejections that returned a valid HTTP
-     *                    response (the server said "no", but the transport
-     *                    worked fine), and for client-side validation errors
-     *                    (missing code, missing verifier).
+     * - [MissingCode] — the callback URI had no `code` parameter.
+     * - [MissingVerifier] — the PKCE verifier was lost (process death).
+     * - [ServerRejected] — the server returned a non-2xx response, or
+     *   the 2xx body could not be parsed.
+     * - [NetworkError] — transport-level failure (DNS, TLS, timeout).
      */
-    data class Failure(
-        val httpCode: Int?,
-        val message: String,
-        val cause: Throwable? = null,
-    ) : PixivOAuthResult()
+    sealed class Failure : PixivOAuthResult() {
+
+        /** Human-readable description suitable for debug logging. */
+        abstract val message: String
+
+        /** The underlying exception, if any. */
+        abstract val cause: Throwable?
+
+        /**
+         * No `code` query parameter in the callback URI.
+         *
+         * This typically means the intent-filter matched an unrelated URI,
+         * or the user cancelled login and the server redirected without a code.
+         */
+        data class MissingCode(
+            override val message: String,
+            override val cause: Throwable? = null,
+        ) : Failure()
+
+        /**
+         * The PKCE verifier was not found in the [VerifierStore].
+         *
+         * Most commonly caused by process death between [PixivOAuthClient.startLogin]
+         * and [PixivOAuthClient.handleCallback] when using [InMemoryVerifierStore].
+         * Use a persistent [VerifierStore] to survive this, or prompt the user
+         * to log in again.
+         */
+        data class MissingVerifier(
+            override val message: String,
+            override val cause: Throwable? = null,
+        ) : Failure()
+
+        /**
+         * The server returned a non-2xx response, an empty body, or a body
+         * that could not be parsed into [PixivOAuthResponse].
+         *
+         * @property httpCode HTTP status code (e.g. 400, 401, 403).
+         */
+        data class ServerRejected(
+            val httpCode: Int,
+            override val message: String,
+            override val cause: Throwable? = null,
+        ) : Failure()
+
+        /**
+         * Network-level failure before a response was received:
+         * DNS resolution, TLS handshake, connection timeout, or
+         * connection reset.
+         */
+        data class NetworkError(
+            override val message: String,
+            override val cause: Throwable? = null,
+        ) : Failure()
+    }
 
     /** `true` when this is a [Success]. */
     val isSuccess: Boolean get() = this is Success
@@ -83,16 +139,18 @@ sealed class PixivOAuthResult {
 
     /**
      * Run [block] if this is a [Success], returning the same result
-     * for chaining.
+     * for chaining. The block receives the full [Success] object,
+     * giving access to both [Success.response] and [Success.rawBody].
      */
-    inline fun onSuccess(block: (PixivOAuthResponse) -> Unit): PixivOAuthResult {
-        if (this is Success) block(response)
+    inline fun onSuccess(block: (Success) -> Unit): PixivOAuthResult {
+        if (this is Success) block(this)
         return this
     }
 
     /**
      * Run [block] if this is a [Failure], returning the same result
-     * for chaining.
+     * for chaining. The block receives the [Failure] sealed type —
+     * use `when` to match on specific subtypes.
      */
     inline fun onFailure(block: (Failure) -> Unit): PixivOAuthResult {
         if (this is Failure) block(this)

@@ -173,7 +173,7 @@ class PixivOAuthClientTest {
         val result = client.exchangeCode("bad-code", "verifier")
 
         assertTrue(result.isFailure)
-        val failure = result as PixivOAuthResult.Failure
+        val failure = result as PixivOAuthResult.Failure.ServerRejected
         assertEquals(400, failure.httpCode)
         assertNull(failure.cause)
     }
@@ -228,7 +228,7 @@ class PixivOAuthClientTest {
 
         var token: String? = null
         client.exchangeCode("code", "verifier")
-            .onSuccess { token = it.accessToken }
+            .onSuccess { token = it.response.accessToken }
 
         assertEquals("access_token_value", token)
     }
@@ -242,6 +242,49 @@ class PixivOAuthClientTest {
             .onFailure { failMsg = it.message }
 
         assertNotNull(failMsg)
+    }
+
+    // ── Default headers ────────────────────────────────────────────
+
+    @Test
+    fun `default headers are sent when addDefaultHeaders is true`() {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        client.exchangeCode("code", "verifier")
+
+        val request = server.takeRequest()
+        assertNotNull(request.getHeader("User-Agent"))
+        assertTrue(request.getHeader("User-Agent")!!.startsWith("PixivAndroidApp/"))
+        assertEquals("android", request.getHeader("App-OS"))
+        assertNotNull(request.getHeader("App-OS-Version"))
+        assertNotNull(request.getHeader("X-Client-Time"))
+        assertNotNull(request.getHeader("X-Client-Hash"))
+    }
+
+    @Test
+    fun `default headers are not sent when addDefaultHeaders is false`() {
+        val noHeaderClient = PixivOAuthClient(
+            testConfig(server.url("/").toString()),
+            addDefaultHeaders = false,
+        )
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(VALID_TOKEN_RESPONSE),
+        )
+
+        noHeaderClient.exchangeCode("code", "verifier")
+
+        val request = server.takeRequest()
+        assertNull(request.getHeader("App-OS"))
+        assertNull(request.getHeader("X-Client-Time"))
+        assertNull(request.getHeader("X-Client-Hash"))
     }
 
     // ── issuedAtMillis ────────────────────────────────────────────
@@ -335,6 +378,7 @@ class PixivOAuthClientTest {
         val result = customClient.handleCallback(uri)
 
         assertTrue(result.isFailure)
+        assertTrue(result is PixivOAuthResult.Failure.MissingVerifier)
         assertTrue((result as PixivOAuthResult.Failure).message.contains("No pending PKCE verifier"))
     }
 
@@ -399,7 +443,7 @@ class PixivOAuthClientTest {
 
         val result = client.exchangeCodeSuspend("bad", "verifier")
         assertTrue(result.isFailure)
-        assertEquals(400, (result as PixivOAuthResult.Failure).httpCode)
+        assertEquals(400, (result as PixivOAuthResult.Failure.ServerRejected).httpCode)
     }
 
     @Test
@@ -497,6 +541,7 @@ class PixivOAuthClientTest {
         val uri = android.net.Uri.parse("pixiv://account/login")
         val result = client.handleCallback(uri)
         assertTrue(result.isFailure)
+        assertTrue(result is PixivOAuthResult.Failure.MissingCode)
         assertTrue((result as PixivOAuthResult.Failure).message.contains("No 'code'"))
     }
 
@@ -535,8 +580,7 @@ class PixivOAuthClientTest {
         val result = client.exchangeCode("code", "verifier")
 
         assertTrue(result.isFailure)
-        val failure = result as PixivOAuthResult.Failure
-        assertNull(failure.httpCode)
+        val failure = result as PixivOAuthResult.Failure.NetworkError
         assertNotNull(failure.cause)
     }
 
@@ -570,7 +614,7 @@ class PixivOAuthClientTest {
         val result = client.refreshToken("expired-token")
 
         assertTrue(result.isFailure)
-        assertEquals(401, (result as PixivOAuthResult.Failure).httpCode)
+        assertEquals(401, (result as PixivOAuthResult.Failure.ServerRejected).httpCode)
     }
 
     // ── PixivOAuthResult chaining ────────────────────────────────────
@@ -615,7 +659,7 @@ class PixivOAuthClientTest {
         var failureInvoked = false
 
         client.exchangeCode("code", "verifier")
-            .onSuccess { successToken = it.accessToken }
+            .onSuccess { successToken = it.response.accessToken }
             .onFailure { failureInvoked = true }
 
         assertEquals("access_token_value", successToken)
@@ -653,6 +697,7 @@ class PixivOAuthClientTest {
         val uri = android.net.Uri.parse("pixiv://account/login")
         val result = client.handleCallbackSuspend(uri)
         assertTrue(result.isFailure)
+        assertTrue(result is PixivOAuthResult.Failure.MissingCode)
         assertTrue((result as PixivOAuthResult.Failure).message.contains("No 'code'"))
     }
 
@@ -661,6 +706,7 @@ class PixivOAuthClientTest {
         val uri = android.net.Uri.parse("pixiv://account/login?code=test")
         val result = client.handleCallbackSuspend(uri)
         assertTrue(result.isFailure)
+        assertTrue(result is PixivOAuthResult.Failure.MissingVerifier)
         assertTrue(
             (result as PixivOAuthResult.Failure).message.contains("No pending PKCE verifier"),
         )
@@ -705,7 +751,7 @@ class PixivOAuthClientTest {
         val result = client.refreshTokenSuspend("bad-token")
 
         assertTrue(result.isFailure)
-        assertEquals(401, (result as PixivOAuthResult.Failure).httpCode)
+        assertEquals(401, (result as PixivOAuthResult.Failure.ServerRejected).httpCode)
     }
 
     @Test
@@ -715,8 +761,8 @@ class PixivOAuthClientTest {
         val result = client.exchangeCodeSuspend("code", "verifier")
 
         assertTrue(result.isFailure)
-        assertNull((result as PixivOAuthResult.Failure).httpCode)
-        assertNotNull(result.cause)
+        val failure = result as PixivOAuthResult.Failure.NetworkError
+        assertNotNull(failure.cause)
     }
 
     // ── Cancellation ─────────────────────────────────────────────────

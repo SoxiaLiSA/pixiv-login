@@ -40,7 +40,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.github.CeuiLiSA"
                 artifactId = "pixiv-login"
-                version = "1.1.0"
+                version = "1.2.0"
             }
         }
     }
