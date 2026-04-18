@@ -23,7 +23,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("com.github.SoxiaLiSA:pixiv-login:1.0.0")
+    implementation("com.github.SoxiaLiSA:pixiv-login:1.2.0")
 }
 ```
 
@@ -97,10 +97,26 @@ private fun handleIntent(intent: Intent?) {
         is PixivOAuthResult.Success -> {
             val accessToken  = result.response.accessToken
             val refreshToken = result.response.refreshToken
+            val rawBody      = result.rawBody // raw JSON for custom deserialization
             // save tokens, navigate to main screen
         }
         is PixivOAuthResult.Failure -> {
-            Log.e("Login", "Failed: ${result.message}")
+            // Structured error handling — no string matching needed
+            when (result) {
+                is PixivOAuthResult.Failure.MissingVerifier -> {
+                    // Process died between startLogin() and callback
+                    Log.w("Login", "Verifier lost, please log in again")
+                }
+                is PixivOAuthResult.Failure.ServerRejected -> {
+                    Log.e("Login", "Server rejected: HTTP ${result.httpCode}")
+                }
+                is PixivOAuthResult.Failure.NetworkError -> {
+                    Log.e("Login", "Network error", result.cause)
+                }
+                is PixivOAuthResult.Failure.MissingCode -> {
+                    Log.e("Login", "No code in callback URI")
+                }
+            }
         }
     }
 }
@@ -111,7 +127,7 @@ private fun handleIntent(intent: Intent?) {
 ```kotlin
 lifecycleScope.launch {
     val result = client.tryHandleCallbackSuspend(intent) ?: return@launch
-    result.onSuccess { save(it.accessToken, it.refreshToken) }
+    result.onSuccess { save(it.response.accessToken, it.response.refreshToken) }
            .onFailure { Log.e("Login", it.message) }
 }
 ```
@@ -169,6 +185,18 @@ class MmkvVerifierStore(private val mmkv: MMKV) : VerifierStore {
 val client = PixivOAuthClient(
     config = PixivOAuthConfig.PIXIV_ANDROID,
     verifierStore = MmkvVerifierStore(mmkv),
+)
+```
+
+### Disable built-in Pixiv headers
+
+By default, the client adds `User-Agent`, `App-OS`, `X-Client-Time`, and `X-Client-Hash` headers. If you supply your own header interceptor via `baseClient`, opt out:
+
+```kotlin
+val client = PixivOAuthClient(
+    config = PixivOAuthConfig.PIXIV_ANDROID,
+    baseClient = yourOkHttpClient,
+    addDefaultHeaders = false,
 )
 ```
 
